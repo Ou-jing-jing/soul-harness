@@ -58,17 +58,20 @@ export function removeTempDir(dir: string): void {
   rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 }
 
-/** Builds the persistence dependency (if needed) and the daemon itself. */
+/** Builds workspace packages the daemon imports, then the daemon itself. */
 export function buildDaemonApp(): void {
   const tsc = join(REPO_ROOT, 'node_modules', 'typescript', 'bin', 'tsc');
 
-  const persistenceDist = join(REPO_ROOT, 'packages', 'persistence', 'dist', 'index.js');
-  if (!existsSync(persistenceDist)) {
-    execFileSync(
-      process.execPath,
-      [tsc, '-p', join(REPO_ROOT, 'packages', 'persistence', 'tsconfig.build.json')],
-      { cwd: REPO_ROOT, stdio: 'ignore' },
-    );
+  const projects = ['contracts', 'persistence', 'runtime'] as const;
+  for (const name of projects) {
+    const dist = join(REPO_ROOT, 'packages', name, 'dist', 'index.js');
+    if (!existsSync(dist)) {
+      execFileSync(
+        process.execPath,
+        [tsc, '-p', join(REPO_ROOT, 'packages', name, 'tsconfig.build.json')],
+        { cwd: REPO_ROOT, stdio: 'ignore' },
+      );
+    }
   }
 
   execFileSync(process.execPath, [tsc, '-p', join(APP_ROOT, 'tsconfig.build.json')], {

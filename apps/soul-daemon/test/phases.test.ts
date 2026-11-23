@@ -4,11 +4,12 @@ import {
   CAPABILITIES,
   CURRENT_RUNTIME_SURFACE,
   READY_TARGET_SURFACE,
+  RECOVERED_RUNTIME_SURFACE,
   STARTUP_STEPS,
 } from '../src/phases.js';
 
-describe('startup steps stay honest in E1', () => {
-  it('keeps the step ids and does not mark later steps implemented', () => {
+describe('startup steps stay honest', () => {
+  it('keeps the step ids and does not mark the scheduler implemented', () => {
     expect(STARTUP_STEPS.map((step) => step.id)).toStrictEqual([
       'config',
       'logging',
@@ -24,14 +25,10 @@ describe('startup steps stay honest in E1', () => {
       'http_api',
       'health_check',
     ]);
-    for (const id of [
-      'persona_recovery',
-      'runtime_recovery',
-      'event_bus',
-      'scheduler',
-      'http_api',
-      'health_check',
-    ]) {
+    for (const id of ['persona_recovery', 'runtime_recovery']) {
+      expect(STARTUP_STEPS.find((step) => step.id === id)?.status).toBe('implemented');
+    }
+    for (const id of ['event_bus', 'scheduler', 'http_api', 'health_check']) {
       expect(STARTUP_STEPS.find((step) => step.id === id)?.status).toBe('not_implemented');
     }
     expect(STARTUP_STEPS.find((step) => step.id === 'http_api')?.owner).toBe('SH-009');
@@ -88,5 +85,27 @@ describe('runtime surface', () => {
     expect(ready.capabilities.healthEndpoint).toBe('not_implemented');
     expect(ready).not.toBe(CURRENT_RUNTIME_SURFACE);
     expect(CAPABILITIES.scheduler).toBe('not_implemented');
+  });
+
+  it('reports a finished recovery without a scheduler', () => {
+    const recovered = RECOVERED_RUNTIME_SURFACE;
+    expect(recovered.components.personaLifecycle).toEqual({ assembled: true, autoStarted: false });
+    expect(recovered.components.eventBus.assembled).toBe(false);
+    expect(recovered.components.eventBus.acceptsInput).toBe(false);
+    expect(recovered.components.scheduler).toEqual({
+      assembled: false,
+      started: false,
+      state: 'absent',
+      handlerKinds: 0,
+      dispatchesTasks: false,
+    });
+    expect(recovered.capabilities.personaLifecycle).toBe('assembled');
+    expect(recovered.capabilities.runtimeRecovery).toBe('assembled');
+    expect(recovered.capabilities.scheduler).toBe('not_implemented');
+    expect(recovered.capabilities.taskDispatch).toBe('not_implemented');
+    expect(recovered.capabilities.eventBus).toBe('not_implemented');
+    expect(recovered.capabilities.httpApi).toBe('not_implemented');
+    expect(recovered).not.toBe(CURRENT_RUNTIME_SURFACE);
+    expect(recovered).not.toBe(READY_TARGET_SURFACE);
   });
 });

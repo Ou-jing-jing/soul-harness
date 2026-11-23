@@ -14,6 +14,12 @@ import {
   type LogRecord,
   type SpawnedDaemon,
 } from './helpers/harness.js';
+import {
+  prepareDatabase,
+  readTask,
+  seedPersona,
+  seedRunningTask,
+} from './helpers/recovery-seed.js';
 
 const dirs: string[] = [];
 const daemons: SpawnedDaemon[] = [];
@@ -237,6 +243,101 @@ describe('real process lifecycle', { timeout: TEST_TIMEOUT }, () => {
       const code = await spawned.waitForExit();
       expect(code).toBe(4);
       expect(existsSync(join(dir, LOCK_FILE_NAME))).toBe(true);
+      expect(existsSync(join(dir, 'soul.db'))).toBe(false);
+    },
+    TEST_TIMEOUT,
+  );
+
+  it(
+    'finishes recovery on a normal start and does not start a scheduler',
+    async () => {
+      const dir = tempDir();
+      const spawned = spawnDaemon({ env: { SOUL_DATA_DIR: dir }, entry: SIGNAL_RUNNER });
+      daemons.push(spawned);
+
+      await spawned.waitFor((record) => isPhase(record, 'RUNNING'));
+      const code = await spawned.waitForExit();
+
+      expect(code).toBe(0);
+      expect(
+        spawned.records.some(
+          (record) => record['event'] === 'step_ok' && record['step'] === 'runtime_recovery',
+        ),
+      ).toBe(true);
+      expect(spawned.records.some((record) => record['event'] === 'scheduler_started')).toBe(false);
+      expect(spawned.records.some((record) => record['event'] === 'scheduler_created')).toBe(false);
+    },
+    TEST_TIMEOUT,
+  );
+
+  it(
+    'fails closed on a partial recovery and the next start converges only the remaining task',
+    async () => {
+      const dir = tempDir();
+      prepareDatabase(dir, (store) => {
+        seedPersona(store, 1);
+        seedRunningTask(store, 1);
+        seedRunningTask(store, 2);
+      });
+      const smaller = readTask(dir, 1);
+      const larger = readTask(dir, 2);
+
+      const first = spawnDaemon({
+        env: { SOUL_DATA_DIR: dir, SOUL_RECOVERY_MAX_ROWS: '2' },
+      });
+      daemons.push(first);
+      const firstCode = await first.waitForExit();
+      expect(firstCode).toBe(5);
+      const incomplete = first.records.find((record) => record['event'] === 'recovery_incomplete');
+      expect(incomplete?.['reason']).toBe('row_budget_exceeded');
+      expect(incomplete?.['tasksRequeued']).toBe(1);
+      expect(first.records.some((record) => record['event'] === 'scheduler_started')).toBe(false);
+      expect(first.records.some((record) => record['event'] === 'daemon_running')).toBe(false);
+      expect(existsSync(join(dir, LOCK_FILE_NAME))).toBe(false);
+      expect(readTask(dir, 1)).toMatchObject({
+        state: 'queued',
+        attempt: 1,
+        runId: smaller?.runId,
+      });
+      expect(readTask(dir, 2)).toMatchObject({
+        state: 'running',
+        attempt: 1,
+        runId: larger?.runId,
+      });
+
+      const second = spawnDaemon({
+        env: { SOUL_DATA_DIR: dir, SOUL_RECOVERY_MAX_ROWS: '10000' },
+        entry: SIGNAL_RUNNER,
+      });
+      daemons.push(second);
+      await second.waitFor((record) => isPhase(record, 'RUNNING'));
+      const secondCode = await second.waitForExit();
+      expect(secondCode).toBe(0);
+      const step = second.records.find(
+        (record) => record['event'] === 'step_ok' && record['step'] === 'runtime_recovery',
+      );
+      expect(step?.['tasksRequeued']).toBe(1);
+      expect(readTask(dir, 1)).toMatchObject({
+        state: 'queued',
+        attempt: 1,
+        runId: smaller?.runId,
+      });
+      expect(readTask(dir, 2)).toMatchObject({ state: 'queued', attempt: 1, runId: larger?.runId });
+    },
+    TEST_TIMEOUT,
+  );
+
+  it(
+    'rejects a missing task policy before opening the database',
+    async () => {
+      const dir = tempDir();
+      const spawned = spawnDaemon({
+        env: { SOUL_DATA_DIR: dir, SOUL_TASK_MAX_ATTEMPTS: '' },
+      });
+      daemons.push(spawned);
+
+      const code = await spawned.waitForExit();
+      expect(code).toBe(2);
       expect(existsSync(join(dir, 'soul.db'))).toBe(false);
     },
     TEST_TIMEOUT,

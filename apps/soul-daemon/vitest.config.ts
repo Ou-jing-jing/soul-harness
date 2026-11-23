@@ -17,6 +17,9 @@ export default defineConfig({
       '@soul-harness/persistence': fileURLToPath(
         new URL('../../packages/persistence/src/index.ts', import.meta.url),
       ),
+      '@soul-harness/runtime': fileURLToPath(
+        new URL('../../packages/runtime/src/index.ts', import.meta.url),
+      ),
     },
   },
   test: {

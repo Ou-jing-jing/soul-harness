@@ -7,11 +7,11 @@
  *   RUNNING → DRAINING → CHECKPOINTING → CLOSING → STOPPED
  *
  * What is real: configuration, structured logging, data-directory probe, the
- * single-instance lock, opening SQLite, running migrations and verifying the
- * schema. What is **not** real yet, and is reported as such: persona recovery,
- * runtime recovery, event bus, scheduler, HTTP/WebSocket and health transport.
- * The daemon reaches `RUNNING` as a *process* that owns its database — not as a
- * recovered runtime, and every log line and report says so.
+ * single-instance lock, opening SQLite, running migrations, verifying the
+ * schema, normalizing crashed personas, and `recoverRuntime`. What is **not**
+ * real yet: the event bus, the scheduler, HTTP/WebSocket and the health
+ * transport. Recovery must finish completely before the process is allowed to
+ * continue, and this phase does not create those later components.
  *
  * Resource discipline: acquisition order is recorded, failures unwind it in
  * reverse, and cleanup failures are collected and reported instead of being
@@ -23,16 +23,26 @@ import { join } from 'node:path';
 import { migrate, openStore, verifySchema, type Store } from '@soul-harness/persistence';
 
 import type { DaemonConfig } from './config.js';
+import {
+  adaptRecoveryLogger,
+  runPersonaRecovery,
+  runRuntimeRecovery,
+  toRuntimeNow,
+  type PersonaRecoveryOutcome,
+} from './components.js';
 import { ensureDataDir } from './data-dir.js';
 import { DaemonError, isDaemonError } from './errors.js';
 import { acquireInstanceLock, type InstanceLock } from './lock.js';
 import type { Logger } from './logger.js';
 import {
-  CAPABILITIES,
+  CURRENT_RUNTIME_SURFACE,
+  RECOVERED_RUNTIME_SURFACE,
   STARTUP_STEPS,
-  type DaemonCapabilities,
+  type DaemonComponentSurface,
   type DaemonPhase,
+  type DaemonRuntimeSurface,
   type LifecycleStep,
+  type RuntimeCapabilitySurface,
 } from './phases.js';
 
 export interface DaemonOptions {
@@ -47,15 +57,26 @@ export interface StepOutcome {
   readonly code?: string;
 }
 
+export interface DaemonRecoverySummary {
+  readonly personasNormalized: number;
+  readonly personasScanned: number;
+  readonly tasksRequeued: number;
+  readonly tasksFailed: number;
+  readonly eventsExpired: number;
+}
+
 export interface StartReport {
   readonly phase: 'RUNNING';
   readonly pid: number;
   readonly dataDir: string;
   readonly databaseFile: string;
+  readonly bootId: string;
   readonly appliedMigrations: readonly number[];
   readonly currentVersion: number;
   readonly skippedSteps: readonly string[];
-  readonly capabilities: DaemonCapabilities;
+  readonly recovery: DaemonRecoverySummary;
+  readonly components: DaemonComponentSurface;
+  readonly capabilities: RuntimeCapabilitySurface;
 }
 
 export interface StopReport {
@@ -69,10 +90,14 @@ export interface DaemonStatus {
   readonly pid: number;
   readonly dataDir: string;
   readonly startedAt: string | null;
+  readonly bootId: string | null;
   readonly storeOpen: boolean;
   readonly lockHeld: boolean;
   readonly lockPath: string | null;
-  readonly capabilities: DaemonCapabilities;
+  readonly personaLifecycleAssembled: boolean;
+  readonly recovery: DaemonRecoverySummary | null;
+  readonly components: DaemonComponentSurface;
+  readonly capabilities: RuntimeCapabilitySurface;
 }
 
 interface Resource {
@@ -110,6 +135,10 @@ export class SoulDaemon {
   #resources: Resource[] = [];
   #lock: InstanceLock | null = null;
   #store: Store | null = null;
+  #lifecycle: PersonaRecoveryOutcome['lifecycle'] | null = null;
+  #surface: DaemonRuntimeSurface = CURRENT_RUNTIME_SURFACE;
+  #recovery: DaemonRecoverySummary | null = null;
+  #recoveryAbort: AbortController | null = null;
 
   #startedAt: string | null = null;
   #stopRequested = false;
@@ -138,10 +167,14 @@ export class SoulDaemon {
       pid: process.pid,
       dataDir: this.#config.dataDir,
       startedAt: this.#startedAt,
+      bootId: this.#lock?.holder.bootToken ?? null,
       storeOpen: this.#store !== null,
       lockHeld: this.#lock !== null,
       lockPath: this.#lock?.path ?? null,
-      capabilities: CAPABILITIES,
+      personaLifecycleAssembled: this.#lifecycle !== null,
+      recovery: this.#recovery,
+      components: this.#surface.components,
+      capabilities: this.#surface.capabilities,
     };
   }
 
@@ -163,6 +196,9 @@ export class SoulDaemon {
    */
   stop(reason: string = 'requested'): Promise<StopReport> {
     this.#stopRequested = true;
+    // Recovery checks this signal only at a query or row boundary. A stop
+    // requested inside the synchronous scan is not an instant preemption.
+    this.#recoveryAbort?.abort();
 
     if (this.#stopPromise === null) {
       this.#stopPromise = (async (): Promise<StopReport> => {
@@ -233,23 +269,31 @@ export class SoulDaemon {
       this.#logger.info('step_ok', { step: 'schema_verification' });
       await this.#boundary();
 
-      // 8/9. recovery — not implemented; reported, never faked
+      // 8/9. Persona normalize, then runtime recovery. Both must settle before
+      // the store can close. No ingress and no scheduler are created here.
       this.#enter('RECOVERING');
-      this.#skipSteps('RECOVERING', skipped);
-
-      // 10–13. transports, scheduler, health — not implemented
-      this.#enter('READY');
-      this.#skipSteps('READY', skipped);
+      await this.#boundary();
+      const recovery = await this.#recover(store, lock.holder.bootToken);
       await this.#boundary();
 
-      // 14. running (as a process that owns its database, not as a recovered runtime)
+      // 10–13. Transports and the scheduler are still not implemented.
+      this.#enter('READY');
+      this.#skipUnimplemented('READY', skipped);
+      await this.#boundary();
+
+      // 14. Running. Recovery finished; the scheduler still does not exist.
       this.#enter('RUNNING');
       this.#startedAt = this.#clock().toISOString();
+      const surface = this.#surface;
       this.#logger.info('daemon_running', {
         dataDir,
         databaseFile,
-        runtime: 'not_implemented',
-        recovery: 'not_implemented',
+        bootId: lock.holder.bootToken,
+        personaLifecycle: surface.capabilities.personaLifecycle,
+        runtimeRecovery: surface.capabilities.runtimeRecovery,
+        eventBus: surface.capabilities.eventBus,
+        scheduler: surface.capabilities.scheduler,
+        taskDispatch: surface.capabilities.taskDispatch,
       });
 
       return {
@@ -257,10 +301,13 @@ export class SoulDaemon {
         pid: process.pid,
         dataDir,
         databaseFile,
+        bootId: lock.holder.bootToken,
         appliedMigrations: migration.applied,
         currentVersion: migration.currentVersion,
         skippedSteps: skipped,
-        capabilities: CAPABILITIES,
+        recovery,
+        components: surface.components,
+        capabilities: surface.capabilities,
       };
     } catch (error) {
       const cleanup = this.#releaseAll();
@@ -357,13 +404,17 @@ export class SoulDaemon {
     }
     if (outcomes.some((entry) => entry.step === 'sqlite_open')) {
       this.#store = null;
+      this.#lifecycle = null;
+      this.#surface = CURRENT_RUNTIME_SURFACE;
     }
 
     return outcomes;
   }
 
-  #skipSteps(phase: 'RECOVERING' | 'READY', skipped: string[]): void {
-    for (const step of STARTUP_STEPS.filter((entry) => entry.phase === phase)) {
+  #skipUnimplemented(phase: 'READY', skipped: string[]): void {
+    for (const step of STARTUP_STEPS.filter(
+      (entry) => entry.phase === phase && entry.status === 'not_implemented',
+    )) {
       skipped.push(step.id);
       this.#logSkipped(step);
     }
@@ -398,5 +449,112 @@ export class SoulDaemon {
   #enter(phase: DaemonPhase): void {
     this.#phase = phase;
     this.#logger.info('phase_entered', { phase });
+  }
+
+  /**
+   * Persona normalize, then runtime recovery.
+   *
+   * A stop requested before the result is interpreted is `startup_aborted`,
+   * never `recovery_incomplete`. The store stays open until this promise
+   * settles; cleanup is the caller's job.
+   */
+  async #recover(store: Store, bootId: string): Promise<DaemonRecoverySummary> {
+    const controller = new AbortController();
+    this.#recoveryAbort = controller;
+    if (this.#stopRequested) {
+      controller.abort();
+    }
+
+    const now = toRuntimeNow(this.#clock);
+    const logger = adaptRecoveryLogger(this.#logger);
+
+    try {
+      let normalized = 0;
+      try {
+        const persona = await runPersonaRecovery({ store, logger, bootId, now });
+        this.#lifecycle = persona.lifecycle;
+        normalized = persona.normalized;
+      } catch (error) {
+        this.#throwRecoveryFailure(error, 'persona_recovery_failed', 'persona recovery failed');
+      }
+
+      this.#logger.info('step_ok', { step: 'persona_recovery', normalized });
+
+      if (this.#stopRequested) {
+        controller.abort();
+      }
+
+      let report;
+      try {
+        report = await runRuntimeRecovery({
+          store,
+          logger,
+          policy: this.#config.policy,
+          now,
+          recovery: this.#config.recovery,
+          signal: controller.signal,
+        });
+      } catch (error) {
+        this.#throwRecoveryFailure(error, 'runtime_recovery_failed', 'runtime recovery failed');
+      }
+
+      // Stop wins over an incomplete report produced while the signal aborted.
+      if (this.#stopRequested) {
+        throw new DaemonError('startup_aborted', 'stop requested while the daemon was booting');
+      }
+
+      if (report.incomplete !== null) {
+        const reason = report.incomplete.reason;
+        this.#logger.error('recovery_incomplete', {
+          reason,
+          personasScanned: report.personasScanned,
+          tasksRequeued: report.tasks.requeued,
+          tasksFailed: report.tasks.failed,
+          eventsExpired: report.events.expired,
+        });
+        throw new DaemonError('recovery_incomplete', 'runtime recovery did not finish', {
+          details: { reason },
+        });
+      }
+
+      const summary: DaemonRecoverySummary = Object.freeze({
+        personasNormalized: normalized,
+        personasScanned: report.personasScanned,
+        tasksRequeued: report.tasks.requeued,
+        tasksFailed: report.tasks.failed,
+        eventsExpired: report.events.expired,
+      });
+      this.#recovery = summary;
+      this.#surface = RECOVERED_RUNTIME_SURFACE;
+      this.#logger.info('step_ok', {
+        step: 'runtime_recovery',
+        personasScanned: summary.personasScanned,
+        tasksRequeued: summary.tasksRequeued,
+        tasksFailed: summary.tasksFailed,
+        eventsExpired: summary.eventsExpired,
+      });
+      return summary;
+    } finally {
+      this.#recoveryAbort = null;
+    }
+  }
+
+  #throwRecoveryFailure(
+    error: unknown,
+    code: 'persona_recovery_failed' | 'runtime_recovery_failed',
+    message: string,
+  ): never {
+    if (this.#stopRequested) {
+      throw new DaemonError('startup_aborted', 'stop requested while the daemon was booting');
+    }
+    if (isDaemonError(error)) {
+      throw error;
+    }
+    if (code === 'runtime_recovery_failed') {
+      this.#logger.error('runtime_recovery_failed', { code });
+    } else {
+      this.#logger.error('persona_recovery_failed', { code });
+    }
+    throw new DaemonError(code, message, { cause: error });
   }
 }
