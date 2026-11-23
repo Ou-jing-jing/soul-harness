@@ -102,6 +102,39 @@ describe('configuration is explicit', () => {
     });
     expect(config.shutdownTimeoutMs).toBe(2500);
   });
+
+  it('keeps the legacy numeric forms of the shutdown timeout', () => {
+    for (const value of ['2500', '2500.0', '2.5e3', '+2500']) {
+      const config = loadConfig({
+        [CONFIG_ENV_VARS.dataDir]: 'x',
+        [CONFIG_ENV_VARS.shutdownTimeoutMs]: value,
+        ...policyEnv(),
+      });
+      expect(config.shutdownTimeoutMs, value).toBe(2500);
+    }
+  });
+
+  it('still rejects a shutdown timeout that is not an in-range integer', () => {
+    const limit = CONFIG_LIMITS.shutdownTimeoutMs;
+    for (const value of ['0', '99', '600001', '-5', 'abc', '1.5', '2.5e0']) {
+      const env = {
+        [CONFIG_ENV_VARS.dataDir]: 'x',
+        [CONFIG_ENV_VARS.shutdownTimeoutMs]: value,
+      };
+      expect(
+        codeOf(() => loadConfig(env)),
+        value,
+      ).toBe('config_invalid');
+      expect(
+        detailsOf(() => loadConfig(env)),
+        value,
+      ).toEqual({
+        variable: CONFIG_ENV_VARS.shutdownTimeoutMs,
+        min: limit.min,
+        max: limit.max,
+      });
+    }
+  });
 });
 
 describe('required task policy', () => {

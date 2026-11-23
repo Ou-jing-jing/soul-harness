@@ -154,6 +154,29 @@ function readOptionalInt(
   return parseBoundedInt(raw, name, bound);
 }
 
+/**
+ * Legacy parser for `SOUL_SHUTDOWN_TIMEOUT_MS` only.
+ * `Number()` plus `Number.isInteger()` keeps values such as `2500.0`, `2.5e3`
+ * and `+2500`. The nine newer variables stay on `parseBoundedInt`.
+ */
+function readShutdownTimeout(env: NodeJS.ProcessEnv): number {
+  const name = CONFIG_ENV_VARS.shutdownTimeoutMs;
+  const bound = CONFIG_LIMITS.shutdownTimeoutMs;
+  const raw = readRaw(env, name);
+  if (raw === undefined) {
+    return bound.fallback;
+  }
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < bound.min || parsed > bound.max) {
+    throw new DaemonError(
+      'config_invalid',
+      `${name} must be an integer between ${bound.min} and ${bound.max}`,
+      { details: { variable: name, min: bound.min, max: bound.max } },
+    );
+  }
+  return parsed;
+}
+
 /** Parses and validates the daemon configuration from the environment. */
 export function loadConfig(
   env: NodeJS.ProcessEnv = process.env,
@@ -182,11 +205,7 @@ export function loadConfig(
     );
   }
 
-  const shutdownTimeoutMs = readOptionalInt(
-    env,
-    CONFIG_ENV_VARS.shutdownTimeoutMs,
-    CONFIG_LIMITS.shutdownTimeoutMs,
-  );
+  const shutdownTimeoutMs = readShutdownTimeout(env);
 
   const policy: TaskPolicy = Object.freeze({
     maxAttempts: readRequiredInt(
