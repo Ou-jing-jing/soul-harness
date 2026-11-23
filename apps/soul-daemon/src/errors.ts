@@ -22,7 +22,8 @@ export const DAEMON_ERROR_CODES = [
   // lifecycle
   'startup_aborted',
   'startup_failed',
-  // Reserved for later SH-008E phases. E1 does not raise these.
+  // E2 raises the three recovery codes. The bus and scheduler codes stay
+  // reserved until READY assembly; this batch does not raise them.
   'persona_recovery_failed',
   'runtime_recovery_failed',
   'recovery_incomplete',

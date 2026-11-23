@@ -8,7 +8,8 @@
  * marked `not_implemented` with the stage that owns it.
  *
  * That is the difference between "the database is open" and "the runtime has
- * recovered": the daemon reports the former and refuses to claim the latter.
+ * recovered". E2 performs persona normalize and `recoverRuntime`. It does not
+ * create an ingress or a scheduler, and it must not report those as running.
  */
 
 export const BOOT_PHASES = ['BOOTING', 'MIGRATING', 'RECOVERING', 'READY', 'RUNNING'] as const;
@@ -80,16 +81,14 @@ export const STARTUP_STEPS: readonly LifecycleStep[] = [
   {
     id: 'persona_recovery',
     phase: 'RECOVERING',
-    status: 'not_implemented',
-    owner: 'SH-008',
-    note: 'requires the Runtime package',
+    status: 'implemented',
+    note: 'normalize crashed personas; nothing is auto-started',
   },
   {
     id: 'runtime_recovery',
     phase: 'RECOVERING',
-    status: 'not_implemented',
-    owner: 'SH-008',
-    note: 'checkpoint/queue/threads restore; not implemented',
+    status: 'implemented',
+    note: 'recoverRuntime is fail-closed; no scheduler in this phase',
   },
   {
     id: 'event_bus',
@@ -249,6 +248,42 @@ export const CURRENT_RUNTIME_SURFACE: DaemonRuntimeSurface = freezeSurface(
     structuredLogging: true,
     personaLifecycle: 'not_implemented',
     runtimeRecovery: 'not_implemented',
+    eventBus: 'not_implemented',
+    eventIngress: 'not_implemented',
+    scheduler: 'not_implemented',
+    taskDispatch: 'not_implemented',
+    httpApi: 'not_implemented',
+    healthEndpoint: 'not_implemented',
+  },
+);
+
+/**
+ * What a successful E2 boot can say. Persona recovery ran; nothing was
+ * auto-started. Ingress and the scheduler do not exist. `runtimeRecovery:
+ * 'assembled'` here means the recovery pass finished with `incomplete === null`,
+ * not that a scheduler is running.
+ */
+export const RECOVERED_RUNTIME_SURFACE: DaemonRuntimeSurface = freezeSurface(
+  {
+    personaLifecycle: { assembled: true, autoStarted: false },
+    eventBus: { assembled: false, initialized: false, transport: 'none', acceptsInput: false },
+    scheduler: {
+      assembled: false,
+      started: false,
+      state: 'absent',
+      handlerKinds: 0,
+      dispatchesTasks: false,
+    },
+    httpApi: 'not_implemented',
+    healthEndpoint: 'not_implemented',
+  },
+  {
+    persistence: true,
+    migrations: true,
+    instanceLock: true,
+    structuredLogging: true,
+    personaLifecycle: 'assembled',
+    runtimeRecovery: 'assembled',
     eventBus: 'not_implemented',
     eventIngress: 'not_implemented',
     scheduler: 'not_implemented',

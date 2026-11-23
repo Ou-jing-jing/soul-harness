@@ -63,16 +63,38 @@ describe('startup', () => {
     const phases = events(records, 'phase_entered').map((record) => record['phase']);
     expect(phases).toStrictEqual(['MIGRATING', 'RECOVERING', 'READY', 'RUNNING']);
 
-    // Unimplemented stages are reported, never claimed.
-    expect(report.skippedSteps).toContain('persona_recovery');
-    expect(report.skippedSteps).toContain('runtime_recovery');
-    expect(report.skippedSteps).toContain('scheduler');
-    expect(report.skippedSteps).toContain('http_api');
-    expect(report.capabilities.runtime).toBe('not_implemented');
-    expect(report.capabilities.recovery).toBe('not_implemented');
+    expect(report.skippedSteps).not.toContain('persona_recovery');
+    expect(report.skippedSteps).not.toContain('runtime_recovery');
+    expect(report.skippedSteps).toEqual(['event_bus', 'scheduler', 'http_api', 'health_check']);
+    expect(report.recovery).toEqual({
+      personasNormalized: 0,
+      personasScanned: 0,
+      tasksRequeued: 0,
+      tasksFailed: 0,
+      eventsExpired: 0,
+    });
+    expect(report.components.personaLifecycle).toEqual({ assembled: true, autoStarted: false });
+    expect(report.components.eventBus.assembled).toBe(false);
+    expect(report.components.scheduler).toEqual({
+      assembled: false,
+      started: false,
+      state: 'absent',
+      handlerKinds: 0,
+      dispatchesTasks: false,
+    });
+    expect(report.capabilities.scheduler).toBe('not_implemented');
+    expect(report.capabilities.runtimeRecovery).toBe('assembled');
+    expect(report.capabilities.httpApi).toBe('not_implemented');
+    expect(daemon.status.components).toBe(report.components);
+    expect(daemon.status.capabilities).toBe(report.capabilities);
+    expect(daemon.status.personaLifecycleAssembled).toBe(true);
+    expect(daemon.status.bootId).toBe(report.bootId);
+    expect(lock['bootToken']).toBe(report.bootId);
 
     const running = events(records, 'daemon_running')[0];
-    expect(running?.['runtime']).toBe('not_implemented');
+    expect(running?.['scheduler']).toBe('not_implemented');
+    expect(running?.['taskDispatch']).toBe('not_implemented');
+    expect(records.some((record) => record['event'] === 'scheduler_started')).toBe(false);
 
     await daemon.stop('test-finished');
   });

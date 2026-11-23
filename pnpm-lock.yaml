@@ -47,6 +47,9 @@ importers:
       '@soul-harness/persistence':
         specifier: workspace:*
         version: link:../../packages/persistence
+      '@soul-harness/runtime':
+        specifier: workspace:*
+        version: link:../../packages/runtime
     devDependencies:
       '@types/node':
         specifier: ^24.19.2

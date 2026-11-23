@@ -31,7 +31,8 @@
     "check": "tsc -p tsconfig.json --noEmit && vitest run"
   },
   "dependencies": {
-    "@soul-harness/persistence": "workspace:*"
+    "@soul-harness/persistence": "workspace:*",
+    "@soul-harness/runtime": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^24.19.2"
