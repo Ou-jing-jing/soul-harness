@@ -24,6 +24,7 @@
 - 按 `StimulusIngress.close()` 的实现更正持久化副作用。O-11 的决议（无传输层、接受清缓冲、本批不做 drain）不改。
 - `Store.close()` 失败后 Instance Lock 仍可能被释放。这是风险记录和 **E4 待决项**，本修订不选择、不批准任何处理策略。
 - 回写 SH-008D 验收口径、O-0 完成事实、本文件状态和基线 SHA。O-0 的完成定义本身不改。
+- 随后一次修正：`probe_budget_exceeded` 可以用已确认 env 在 Daemon 入口复现（§12.2.1，21 个 Persona、`maxRowsPerRun=22`）。`scan_query_budget_exceeded` 仍然不能，停止条件保留，不新增 env。
 
 ---
 
@@ -646,7 +647,7 @@ E4 在该决定经过独立复审之前，不得把其中一种写进实现并�
 - Scheduler 并发默认与 D-SCH2 一致（1/8），Daemon 显式传入。
 - Ingress 的上界是 Daemon 自己的防护（Runtime 只要求正整数），避免配置出 10^9 级队列/ TTL；默认值按 O-7 已确认（见 §16.2）。
 - 不新增端口/令牌配置：SH-009 之前没有 API。
-- **【事实，不是新决议】** `recoverRuntime` 还可以接收 `maxScanQueries` 与 `maxProbeQueries`。上表没有对应 env。E0.R1 不新增这两个变量，也不批准用测试专用入口把它们塞进 `daemon.start()`。缺了它们就复现不了的原因，按 §12.2.1 停止。
+- **【事实，不是新决议】** `recoverRuntime` 还可以接收 `maxScanQueries` 与 `maxProbeQueries`。上表没有对应 env，本修订不新增它们，也不批准测试专用入口。不传 `maxProbeQueries` 时用 Runtime 默认 200；§12.2.1 的 Daemon 场景靠这个默认值制造 `probe_budget_exceeded`。不传 `maxScanQueries` 时按其他预算派生，派生值够扫完，已确认 env 复现不了 `scan_query_budget_exceeded`。后者仍按 §12.2.1 停止，不得加 env。
 
 ### 9.3 policy 对象
 
@@ -729,7 +730,7 @@ const policy = Object.freeze({
 
 - `components.ts` 构造 `PersonaLifecycle`（bootId 来自锁）与 Recovery 调用。
 - `daemon.ts` 在 RECOVERING 执行 normalize + recover；fail-closed；记录报告。
-- 增加集成测试：空库、崩溃数据、recovery 抛错、incomplete。预算参数以 §12.2.1 为准。`row_budget_exceeded` 与 `persona_budget_exceeded` 用已确认 env。`scan_query_budget_exceeded` 与 `probe_budget_exceeded` 若无法在不新增 env、不新增测试专用生产 API 的前提下用 `daemon.start()` 复现，E2 **停止并报告**，不得发明入口。
+- 增加集成测试：空库、崩溃数据、recovery 抛错、incomplete。预算参数以 §12.2.1 为准。`row_budget_exceeded`、`persona_budget_exceeded` 和 `probe_budget_exceeded` 都只用已确认 env：探测预算用 Runtime 默认 200，Daemon 场景是 21 个 Persona 加 `SOUL_RECOVERY_MAX_ROWS=22`（见 §12.2.1）。`scan_query_budget_exceeded` 不能靠已确认 env 复现；E2 对此**停止并报告**，不得新增 env，也不得新增测试专用生产 API。
 - 验收：RECOVERING 路径可独立验证；E2 完成时**不创建/不启动 Scheduler**，`phases` 可暂时把 scheduler 标为 pending；完整 `RUNNING` 留到 E3。
 
 ### E3 — READY 装配
@@ -797,10 +798,12 @@ const policy = Object.freeze({
 |---|---|---|---|
 | `row_budget_exceeded`（部分提交） | 1 个 Persona，2 条合法 `running`，`batchSize=200`，`maxRowsPerRun=2`，扫描/探测预算保持默认 | 枚举占用 1 行后 U1 提交 id 较小的那条（`queued`，attempt/runId 不变），然后 `rows >= 2`。另一条仍 `running`。`requeued=1`。探测看见剩余行，但原因保持 `row_budget_exceeded` | 把 `maxRowsPerRun` 提高到足够：只收敛第二条；第一条不再被选中。报告只计这一轮的新变化 |
 | `row_budget_exceeded`（零写入对照） | 同上种子，只把 `maxRowsPerRun` 改成 1 | 枚举读到这一个 Persona 后预算用尽，`scanPersona` 不运行。两条都仍是 `running`，计数为 0。同一个预算再跑仍然零写 | **禁止**断言第一条已 `queued`。之后若用足够预算启动，两条都在那一次被第一次收敛 |
-| `scan_query_budget_exceeded` | `batchSize=1`，`maxScanQueries=3`，`maxRowsPerRun` 用默认或任何 ≥ 3 的值，`maxProbeQueries` 用默认 200，1 个 Persona，2 条 `running` | 查询 1 读到满页的 1 个 Persona（枚举未完成）；查询 2 读到空页（枚举完成）；查询 3 提交 id 较小的任务；查询 4 被拒绝。另一条仍 `running`。最终原因仍是 `scan_query_budget_exceeded`。**禁止**把这组的 `maxRowsPerRun` 设成 2，否则先变成 `row_budget_exceeded` | 默认扫描预算只收敛剩余那条；已 `queued` 的不再处理 |
+| `scan_query_budget_exceeded`（不是 Daemon 入口） | `batchSize=1`，`maxScanQueries=3`，`maxRowsPerRun` 用默认或任何 ≥ 3 的值，`maxProbeQueries` 用默认 200，1 个 Persona，2 条 `running`。§9.2 没有 `maxScanQueries`，已确认 env 打不出这一行 | 查询 1 读到满页的 1 个 Persona（枚举未完成）；查询 2 读到空页（枚举完成）；查询 3 提交 id 较小的任务；查询 4 被拒绝。另一条仍 `running`。最终原因仍是 `scan_query_budget_exceeded`。**禁止**把这组的 `maxRowsPerRun` 设成 2，否则先变成 `row_budget_exceeded` | 默认扫描预算只收敛剩余那条；已 `queued` 的不再处理。本行不得写成 Daemon 已覆盖 |
 | `persona_budget_exceeded` | 3 个 Persona，Persona 1 和 Persona 3 各有一条 `running`，`batchSize=200`，`maxPersonasPerRun=2`，`maxRowsPerRun` 保持默认 | 一页读到 3 人，只接受前 2 人，在 `scanPersona` 之前 abort。**零写入**，包括已经被接受的 Persona 1。`personasScanned=2`。探测可以跑，但不得改原因、不得写任务 | 同一上限再跑仍然零写。把 `maxPersonasPerRun` 提到 3：两条各收敛一次。不要同时把 `maxRowsPerRun` 降到小于本页人数，否则原因会先变成行预算，且第三人根本不在这一页 |
-| `probe_budget_exceeded`（此前已有提交） | 1 个 Persona，1 条 `running`，1 条 `archive_state='none'` 的 `received`，`batchSize=200`，`maxScanQueries=2`，`maxProbeQueries=1`，`maxRowsPerRun` 默认 | U1 提交这条任务。扫描在 U2 停在 `scan_query_budget_exceeded`，事件还没写。第一次探测（U2）是空的，第二次探测被拒绝，**最终原因被替换成** `probe_budget_exceeded`。事件仍是 `received` | 默认预算：`requeued=0`，`expired=1`；任务的 attempt/runId 仍不变 |
-| `probe_budget_exceeded`（零写入） | `maxScanQueries=1`，`maxProbeQueries=1`，1 个 Persona，没有任务。与 `packages/runtime/test/recovery.test.ts` 的探测预算用例相同 | 枚举用掉唯一一次扫描查询，U1 不再查询。零写。最终原因是 `probe_budget_exceeded`（替换掉扫描预算原因） | 默认预算：`incomplete === null`，计数为 0 |
+| `probe_budget_exceeded`（仅 Runtime 参数，此前已有提交） | 1 个 Persona，1 条 `running`，1 条 `archive_state='none'` 的 `received`，`batchSize=200`，`maxScanQueries=2`，`maxProbeQueries=1`，`maxRowsPerRun` 默认。**不是 Daemon 入口**：§9.2 没有这两个查询预算 | U1 提交这条任务。扫描在 U2 停在 `scan_query_budget_exceeded`，事件还没写。第一次探测（U2）是空的，第二次探测被拒绝，**最终原因被替换成** `probe_budget_exceeded`。事件仍是 `received` | 默认预算：`requeued=0`，`expired=1`；任务的 attempt/runId 仍不变。本行只说明 `recoverRuntime` 的参数行为，不得写成 Daemon 已覆盖 |
+| `probe_budget_exceeded`（仅 Runtime 参数，零写入） | `maxScanQueries=1`，`maxProbeQueries=1`，1 个 Persona，没有任务。与 `packages/runtime/test/recovery.test.ts` 的探测预算用例相同。同样**不是 Daemon 入口** | 枚举用掉唯一一次扫描查询，U1 不再查询。零写。最终原因是 `probe_budget_exceeded`（替换掉扫描预算原因） | 默认预算：`incomplete === null`，计数为 0。不得把这条 Runtime 测试写成 SH-008E 已验证 |
+| `probe_budget_exceeded`（Daemon 入口，此前已有提交） | **只用已确认 env。** 21 个 Persona，没有事件。唯一一条合法 `running` 必须在 id **最小**的 Persona 上。`batchSize=200`，`maxRowsPerRun=22`，`maxPersonasPerRun=200`（两项都是 §9.2 默认），**不传** `maxScanQueries` / `maxProbeQueries`（探测默认 200，扫描用派生值） | 枚举一页读到 21 人（21 < 22），枚举完成，`rows=21`。U1 以 `limit=1` 提交这条任务（`queued`，attempt/runId 不变），`rows=22` 后扫描停在 `row_budget_exceeded`，该 U1 不标完成。未完成单元是 21×10=210。探测跑满 200 次空范围，下一次被拒绝，**最终原因替换成** `probe_budget_exceeded`。`requeued=1`。boot fail closed，无 Scheduler | **同一个** `maxRowsPerRun=22` 再启动即可完成，不必加大预算：任务已不是 `running`，空页不再把行预算耗尽，`incomplete === null`，`requeued=0`，已 `queued` 的行不再处理。若这条 `running` 不在最小 id 上，前面的空 Persona 会先扫完，探测可能把剩余范围证成空并报 **complete**（写入仍会发生）。20 个 Persona 且 `maxRowsPerRun=21` 时未完成单元正好 200，200 次空探测都成功，结果也是 **complete**，不是本原因。人数必须是 21，任务必须在最小 id 上，且不能再放会让探测提前命中的行 |
+| `probe_budget_exceeded`（Daemon 入口，零写入） | 20 个 Persona，没有任务、没有事件。`batchSize=20`，`maxRowsPerRun=20`，`maxPersonasPerRun` 保持默认 200，不传两个查询预算 | 枚举读满一页 20 人后行预算用尽，`scanPersona` 不运行。游标之后没有 Persona，探测继续走单元。零写。第 201 次探测被拒绝，原因是 `probe_budget_exceeded` | 同一对预算再跑仍然零写、仍然是这个原因。把 `batchSize` / `maxRowsPerRun` 提高到默认（200 / 10000）后，第二次 `incomplete === null`，计数为 0 |
 | `aborted` | 2 个 Persona，各 1 条 `running`。沿用 Runtime 测试的时钟：`resolveOptions` 的预检是第 1 次 `now()`，Persona 1 的 `finishedAt` 是第 2 次；在第 2 次 abort signal。abort 在行间隙才被看到，所以这次条件写仍然提交 | Persona 1 已 `queued`，attempt/runId 不变；Persona 2 仍 `running`。`requeued=1`。原因是 `aborted`，不进入探测 | 不再 abort：只收敛 Persona 2。若 Daemon 在这次启动里已经请求停止，进程结果是 `startup_aborted`，**不是** `recovery_incomplete`（O-2） |
 | `archive_state_present` | 1 个 Persona。两条都是 `received`：id 较小的 `archive_state='none'`，id 较大的 `archive_state='pending'` | U5 先提交较小的那条（`expired` / `buffer_lost`），再在较大的那条上 fail closed，不写它。探测不运行 | 第二次 `expired=0`，较小那条的 `updated_at` 不变，原因相同。加大预算也不会完成，直到那条 archive 行被数据修复。这不是预算重启 |
 | `unexpected_event_status` | 1 个 Persona。至少一条 `archive_state='none'` 的 `received`，另有一条 `noticed`（`understood` / `response_committed` 同样） | U5 先提交那条 `received`。U6 看到 `noticed` 后 fail closed，不写 U6 行，探测不运行。只有 U6 行、没有可提交的 U5 行时，本次零写 | U6 行还在就一直是同一原因，第二次 `expired=0`。加大预算无效 |
@@ -809,9 +812,9 @@ const policy = Object.freeze({
 
 **【Daemon 覆盖边界，不是新决议】**
 
-- `daemon.start()` 与真实进程可以用已确认 env 覆盖 `row_budget_exceeded`（`SOUL_RECOVERY_MAX_ROWS`）、`persona_budget_exceeded`（`SOUL_RECOVERY_MAX_PERSONAS`）和 `batchSize`（`SOUL_RECOVERY_BATCH_SIZE`），也可以用 SQL 种子覆盖三个失败关闭原因。`aborted` 与 `concurrent_modification` 沿用 §6.2 / §12.6 已经写明的可注入 `now`；真实 `dist/main.js` 没有这只时钟，进程级用例不覆盖这两行的竞态。
-- `scan_query_budget_exceeded` 与 `probe_budget_exceeded` 依赖 `maxScanQueries` / `maxProbeQueries`。§9.2 没有这两个 env。不得新增它们，也不得新增只为测试存在的生产参数。
-- E2 如果不能在上述限制内用 `daemon.start()` 复现这两行，就停止并报告。Runtime 的 `recovery.test.ts` 只证明原因码，不能代替 D-R3 的 Daemon 重启验收，也不能被当成“已经覆盖”。
+- `daemon.start()` 可以用已确认 env 覆盖：`row_budget_exceeded`（`SOUL_RECOVERY_MAX_ROWS`）、`persona_budget_exceeded`（`SOUL_RECOVERY_MAX_PERSONAS`）、`batchSize`（`SOUL_RECOVERY_BATCH_SIZE`），以及上表两行 **Daemon 入口** 的 `probe_budget_exceeded`（默认探测预算 200，不新增 env）。三个失败关闭原因用 SQL 种子。`aborted` 与 `concurrent_modification` 沿用 §6.2 / §12.6 已经写明的可注入 `now`；真实 `dist/main.js` 没有这只时钟，**进程级不算已覆盖**。
+- 上表标成“仅 Runtime 参数”的两行 `probe_budget_exceeded` 依赖显式 `maxScanQueries` / `maxProbeQueries`。它们说明原因如何被替换，**不是** Daemon 验收，不得算作已通过。
+- `scan_query_budget_exceeded` 仍要显式 `maxScanQueries`。不传时扫描预算按 `ceil(maxPersonas/batch)+1 + 10×maxPersonas + maxRows` 派生，派生值够扫完，已确认 env 打不出这个原因。不得新增该 env，也不得新增测试专用生产 API。E2 复现不了就停止并报告。Runtime 的 `recovery.test.ts` 只证明原因码，不能代替这条 Daemon 验收，也不能写成“已经覆盖”。
 
 ### 12.3 READY / Scheduler 生命周期
 
@@ -848,7 +851,7 @@ const policy = Object.freeze({
 - **Recovery 部分完成的进程级覆盖**（O-2 fail-closed；用预算制造，不用 sleep，也不用杀进程时序）。种子固定为 1 个 Persona、2 条合法 `running`：
   - `SOUL_RECOVERY_MAX_ROWS=2`（其余预算用 §9.2 默认）：第一次以 `recovery_incomplete` 失败退出，无 Scheduler；id 较小的任务已是 `queued`，attempt 与 runId 不变；另一条仍是 `running`。第二次把 `SOUL_RECOVERY_MAX_ROWS` 提高到足够扫完：只收敛剩下的那条；已 `queued` 的不再 requeue、不增加 attempt、不换 runId；第二次计数只包含这一轮真正变化的行。
   - `SOUL_RECOVERY_MAX_ROWS=1` 只做零写入对照：第一次同样失败，但两条都仍是 `running`，计数为 0。禁止断言“第一条已经 queued”。再用足够预算启动时，两条都在这一次被第一次收敛。
-- 进程级测试不得新增 env 去制造 `scan_query_budget_exceeded` 或 `probe_budget_exceeded`。做不到就按 §12.2.1 停止并报告。
+- 进程级测试不得新增 env 去制造 `scan_query_budget_exceeded`。做不到就按 §12.2.1 停止并报告，不得把 Runtime 单测写成进程级已覆盖。`probe_budget_exceeded` 不要新 env：用上一节的 Daemon 入口（21 个 Persona，唯一 `running` 在最小 id 上，`SOUL_RECOVERY_MAX_ROWS=22`，其余预算默认）。同一预算第二次启动应 `incomplete === null` 且 `requeued=0`。
 
 ### 12.6 确定性要求
 
@@ -865,8 +868,8 @@ const policy = Object.freeze({
 | 正常关闭 | 12.4；12.5 SIGTERM |
 | 启动失败回滚 | 12.2 invalid/incomplete/throw；12.5 迁移失败 |
 | 重复关闭 | 12.4 幂等 |
-| Recovery 部分完成后重启 | §12.2 的 `maxRowsPerRun=2` 重启，外加 §12.2.1 九种原因；§12.5 进程级用 `SOUL_RECOVERY_MAX_ROWS=2`，并用 `=1` 做零写入对照 |
-| Recovery 幂等 | 12.2 完整恢复后第二次启动 0 变化；normalize 0 条 |
+| Recovery 部分完成后重启 | Daemon 入口只覆盖 §12.2.1 标明能由 `daemon.start()` 复现的原因：`maxRowsPerRun=2` 的部分提交、`=1` 的零写入对照、`persona_budget_exceeded`、Daemon 入口的 `probe_budget_exceeded`（21 个 Persona / `maxRowsPerRun=22`），以及三个 SQL 种子失败关闭原因。§12.5 进程级同样只覆盖这些，外加 `maxRows=2` 与 `=1`。`aborted` / `concurrent_modification` 依赖可注入 `now`，真实进程不算已覆盖。标成“仅 Runtime 参数”的探测行，以及 `scan_query_budget_exceeded`，**都不得写成已验证** |
+| Recovery 幂等 | 12.2 完整恢复后第二次启动 0 变化；normalize 0 条。Daemon 入口的 `probe_budget` 第二次在同一 `maxRowsPerRun=22` 下也是 0 变化 |
 | Recovery/Scheduler lease | 12.3 顺序；Runtime 既有 D4 测试；重启创建 Scheduler |
 | Scheduler 启动/停止 | 12.3/12.4 |
 | 运行期异常 | 明确限制：无 supervisor；Scheduler 内部日志；不伪造用例 |
@@ -882,12 +885,12 @@ const policy = Object.freeze({
 
 1. **代码范围**：生产代码改动只在 `apps/soul-daemon/**`；`pnpm-lock.yaml` 只含新增 runtime workspace 依赖的预期变化（O-1），不夹带版本升级；未改 runtime/persistence/contracts/migration。
 2. **启动与能力声明**：空库启动到 `RUNNING`；RECOVERING 真实执行 normalize + `recoverRuntime`；READY 真实创建 Ingress + Scheduler 并 start；`StartReport` / `status` / 日志使用同一组 `components` 与 `capabilities`，明确：PersonaLifecycle assembled 但 `autoStarted=false`；Ingress assembled/initialized 但 `acceptsInput=false` / `eventIngress='unavailable_no_transport'`；Scheduler `started=true` / `running` 但 `handlerKinds=0` / `dispatchesTasks=false` / `taskDispatch='unavailable_no_handlers'`；HTTP/Health 仍 `not_implemented`。**Scheduler 的 `running` 不得被报告成可派发任务。**
-3. **恢复与幂等**：崩溃种子数据被正确收敛（Persona 归一、running 任务 attempt 不变、活跃事件 expired）；Recovery 抛错/`incomplete` 时 boot 失败且无 Scheduler 残留；`Store.close()` 成功时锁/Store 释放。**部分完成后的重启不会重复处理已收敛行**，参数以 §12.2.1 为准：`maxRowsPerRun=2` 才是一条 Persona、两条 `running` 的部分提交，`maxRowsPerRun=1` 必须保持零写入。完整恢复后的第二次启动为 0 变化。
+3. **恢复与幂等**：崩溃种子数据被正确收敛（Persona 归一、running 任务 attempt 不变、活跃事件 expired）；Recovery 抛错/`incomplete` 时 boot 失败且无 Scheduler 残留；`Store.close()` 成功时锁/Store 释放。**部分完成后的重启不会重复处理已收敛行**，参数以 §12.2.1 为准：`maxRowsPerRun=2` 才是一条 Persona、两条 `running` 的部分提交，`maxRowsPerRun=1` 必须保持零写入。Daemon 入口的 `probe_budget_exceeded` 按该节的 21 Persona / `maxRowsPerRun=22` 场景验收，第二次同一预算为 0 变化。完整恢复后的第二次启动为 0 变化。`scan_query_budget_exceeded` 和“仅 Runtime 参数”的探测行没有 Daemon 入口，**验收时不得写成已通过**。
 4. **lease**：Recovery 与 Scheduler 不重叠；只有 Recovery 成功后才创建 Scheduler；**Scheduler stop resolve 后**才关闭 Store；重启后新 Scheduler 可创建。
 5. **关闭**：正常关闭顺序正确；重复关闭幂等；空 Handler 路径无在途任务；**不声称有界关闭或超时强制关闭**。`Store.close()` 成功时锁在其后释放；没有“放弃等待后继续关库”的路径。close 失败后是否放锁仍是 §7.6 待决，验收不得把未决策略写成已通过。
 6. **配置与契约**：新配置有边界/默认/必填语义，非法值在接触 DB 前失败；两个 policy env 必填、无默认；**实施前已核对 Runtime 实际导出的 policy 类型与 `recoverRuntime` / `createScheduler` 参数（§16.3 O-3），同一个冻结对象同时满足两边**；兼容现有退出码。
 7. **bootId**：启动报告 `bootId` 与锁文件 `bootToken` 完全一致；该值通过当前 `BOOT_ID_PATTERN` / `isBootId` 的实际校验（以 `createPersonaLifecycle` 接受为准，并记录当前 pattern 文本）；PersonaLifecycle 使用同一个值。不兼容时停止报告，不修改 Runtime/Contracts/锁协议。
-8. **测试**：新增测试覆盖 §12 矩阵；`pnpm --filter @soul-harness/soul-daemon test`、运行时全量、根 `pnpm run check` 全绿；真实进程测试覆盖 SIGTERM/SIGKILL/双实例。
+8. **测试**：新增测试覆盖 §12 里标明由 Daemon 入口验证的用例；`pnpm --filter @soul-harness/soul-daemon test`、运行时全量、根 `pnpm run check` 全绿；真实进程测试覆盖 SIGTERM/SIGKILL/双实例。`scan_query_budget_exceeded` 未取得显式扫描预算入口之前不算本项通过；不得用 Runtime 既有测试填这个缺口，也不得为此改矩阵以外的生产代码。
 9. **文档**：`apps/soul-daemon/README.md` 与实现一致；状态/能力/限制明确；不修改其他设计文档；**O-0 开工前置已满足（文档同步提交已合入）**。
 10. **不夸大**：不声称 HTTP/健康、检查点、Handler 认知、跨进程 lease、运行期监督已完成；不把 `scheduler: 'running'` 写成可派发能力。
 11. **独立复审**：实施报告 ≠ 复审结论；CI 结果以远端为准，不接受“本地通过”替代。
@@ -926,7 +929,7 @@ const policy = Object.freeze({
 8. O-9 格式核对失败：`lock.holder.bootToken` 不被当前 `BOOT_ID_PATTERN` / `isBootId` 接受，或启动报告、锁、PersonaLifecycle 三处不能保持同值；不得修改 Runtime/Contracts/锁协议或另生成 ID 绕过。
 9. 维护者要求本批提供 Handler 注入/真实 Handler、或有界关闭；这些超出 D-R1/D-R2 的已确认范围，需先取得新决议。
 10. 发现 D1–D3 的真实缺陷：停止，提交复现/影响/建议报告；不在本批顺手修。
-11. 为了覆盖 `scan_query_budget_exceeded` / `probe_budget_exceeded` 而新增 env 或测试专用生产 API，或在独立复审之前自行选定 §7.6 的锁策略。
+11. 为了覆盖 `scan_query_budget_exceeded` 而新增 env 或测试专用生产 API，或在独立复审之前自行选定 §7.6 的锁策略。`probe_budget_exceeded` 必须用 §12.2.1 的已确认 env 场景，不得改成新增 `maxProbeQueries` env。
 
 ---
 
@@ -992,7 +995,7 @@ const policy = Object.freeze({
 | O-11 | `ingress.close()` 幂等测试只证明第二次不再写，不证明所有曾经缓冲的行都已终态（§7.7）。README/启动报告明确无传输层；不声称“可受理事件” |
 | D-R1 | 代码无“超时后关闭 Store”；无 `shutdown_timeout`；stop pending 时 Store/锁不被关闭 |
 | D-R2 | `DaemonOptions` 无 handlers 字段（`@ts-expect-error` 断言）；Scheduler 创建参数固定空 Map；报告 `handlerKinds: 0` |
-| D-R3 | §12.2 / §12.2.1 / §12.5 通过。部分提交用 §12.2.1 的参数；`maxRowsPerRun=1` 的对照必须保持零写入 |
+| D-R3 | §12.2 / §12.2.1 / §12.5 里 **Daemon 入口** 的用例通过。部分提交用 `maxRowsPerRun=2`；`=1` 的对照必须保持零写入。`probe_budget_exceeded` 的 Daemon 验收只认 21 个 Persona / `maxRowsPerRun=22` 那一行。`scan_query_budget_exceeded` 与“仅 Runtime 参数”的探测行不得算作已通过 |
 
 ---
 
