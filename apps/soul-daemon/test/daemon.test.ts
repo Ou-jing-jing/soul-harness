@@ -8,7 +8,12 @@ import { SoulDaemon } from '../src/daemon.js';
 import { isDaemonError } from '../src/errors.js';
 import { LOCK_FILE_NAME } from '../src/lock.js';
 import type { LogRecord } from './helpers/harness.js';
-import { createRecordingLogger, makeTempDir, removeTempDir } from './helpers/harness.js';
+import {
+  createRecordingLogger,
+  makeTempDir,
+  removeTempDir,
+  TEST_POLICY_ENV,
+} from './helpers/harness.js';
 
 const dirs: string[] = [];
 
@@ -25,7 +30,7 @@ function tempDir(): string {
 }
 
 function makeDaemon(dir: string): { daemon: SoulDaemon; records: LogRecord[] } {
-  const config = loadConfig({ SOUL_DATA_DIR: dir }, process.cwd());
+  const config = loadConfig({ SOUL_DATA_DIR: dir, ...TEST_POLICY_ENV }, process.cwd());
   const { logger, records } = createRecordingLogger();
   return { daemon: new SoulDaemon({ config, logger }), records };
 }

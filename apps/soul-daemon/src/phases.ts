@@ -121,7 +121,7 @@ export const STARTUP_STEPS: readonly LifecycleStep[] = [
   },
 ];
 
-/** Capabilities this build can honestly claim. */
+/** Capabilities this build can honestly claim. E1 has not assembled the Runtime. */
 export interface DaemonCapabilities {
   readonly persistence: true;
   readonly migrations: true;
@@ -147,3 +147,148 @@ export const CAPABILITIES: DaemonCapabilities = Object.freeze({
   httpApi: 'not_implemented',
   healthEndpoint: 'not_implemented',
 });
+
+/**
+ * Four separate questions. None of them implies another:
+ * assembled (the object exists), started (it was started), acceptsInput,
+ * dispatchesTasks.
+ */
+export interface PersonaLifecycleSurface {
+  readonly assembled: boolean;
+  /** This batch never auto-starts personas, even after the object exists. */
+  readonly autoStarted: false;
+}
+
+export interface EventBusSurface {
+  readonly assembled: boolean;
+  readonly initialized: boolean;
+  readonly transport: 'none';
+  readonly acceptsInput: false;
+}
+
+export interface SchedulerSurface {
+  readonly assembled: boolean;
+  readonly started: boolean;
+  /** `absent` is the E1 fact: no scheduler object exists. */
+  readonly state: 'absent' | 'created' | 'running' | 'stopping' | 'stopped';
+  /** Fixed at 0 for this batch. Running does not mean a handler is registered. */
+  readonly handlerKinds: 0;
+  readonly dispatchesTasks: false;
+}
+
+export interface DaemonComponentSurface {
+  readonly personaLifecycle: PersonaLifecycleSurface;
+  readonly eventBus: EventBusSurface;
+  readonly scheduler: SchedulerSurface;
+  readonly httpApi: 'not_implemented';
+  readonly healthEndpoint: 'not_implemented';
+}
+
+/**
+ * Capability words for a later phase. E1's live report is still `CAPABILITIES`.
+ * `scheduler: 'running'` is a different field from `taskDispatch`.
+ */
+export interface RuntimeCapabilitySurface {
+  readonly persistence: true;
+  readonly migrations: true;
+  readonly instanceLock: true;
+  readonly structuredLogging: true;
+  readonly personaLifecycle: 'not_implemented' | 'assembled';
+  readonly runtimeRecovery: 'not_implemented' | 'assembled';
+  readonly eventBus: 'not_implemented' | 'assembled_no_transport';
+  readonly eventIngress: 'not_implemented' | 'unavailable_no_transport';
+  readonly scheduler: 'not_implemented' | 'running';
+  readonly taskDispatch: 'not_implemented' | 'unavailable_no_handlers';
+  readonly httpApi: 'not_implemented';
+  readonly healthEndpoint: 'not_implemented';
+}
+
+export interface DaemonRuntimeSurface {
+  readonly components: DaemonComponentSurface;
+  readonly capabilities: RuntimeCapabilitySurface;
+}
+
+function freezeSurface(
+  components: DaemonComponentSurface,
+  capabilities: RuntimeCapabilitySurface,
+): DaemonRuntimeSurface {
+  return Object.freeze({
+    components: Object.freeze({
+      personaLifecycle: Object.freeze(components.personaLifecycle),
+      eventBus: Object.freeze(components.eventBus),
+      scheduler: Object.freeze(components.scheduler),
+      httpApi: components.httpApi,
+      healthEndpoint: components.healthEndpoint,
+    }),
+    capabilities: Object.freeze(capabilities),
+  });
+}
+
+/**
+ * What E1 can say. Nothing from the Runtime exists, so nothing is assembled
+ * or started, and nothing accepts input or dispatches tasks.
+ */
+export const CURRENT_RUNTIME_SURFACE: DaemonRuntimeSurface = freezeSurface(
+  {
+    personaLifecycle: { assembled: false, autoStarted: false },
+    eventBus: { assembled: false, initialized: false, transport: 'none', acceptsInput: false },
+    scheduler: {
+      assembled: false,
+      started: false,
+      state: 'absent',
+      handlerKinds: 0,
+      dispatchesTasks: false,
+    },
+    httpApi: 'not_implemented',
+    healthEndpoint: 'not_implemented',
+  },
+  {
+    persistence: true,
+    migrations: true,
+    instanceLock: true,
+    structuredLogging: true,
+    personaLifecycle: 'not_implemented',
+    runtimeRecovery: 'not_implemented',
+    eventBus: 'not_implemented',
+    eventIngress: 'not_implemented',
+    scheduler: 'not_implemented',
+    taskDispatch: 'not_implemented',
+    httpApi: 'not_implemented',
+    healthEndpoint: 'not_implemented',
+  },
+);
+
+/**
+ * The shape E3 is allowed to report once those objects actually exist.
+ * Not wired into `SoulDaemon` in E1. `scheduler: 'running'` stays paired with
+ * `taskDispatch: 'unavailable_no_handlers'` and `dispatchesTasks: false`.
+ */
+export const READY_TARGET_SURFACE: DaemonRuntimeSurface = freezeSurface(
+  {
+    personaLifecycle: { assembled: true, autoStarted: false },
+    eventBus: { assembled: true, initialized: true, transport: 'none', acceptsInput: false },
+    scheduler: {
+      assembled: true,
+      started: true,
+      state: 'running',
+      handlerKinds: 0,
+      dispatchesTasks: false,
+    },
+    httpApi: 'not_implemented',
+    healthEndpoint: 'not_implemented',
+  },
+  {
+    persistence: true,
+    migrations: true,
+    instanceLock: true,
+    structuredLogging: true,
+    personaLifecycle: 'assembled',
+    runtimeRecovery: 'assembled',
+    eventBus: 'assembled_no_transport',
+    eventIngress: 'unavailable_no_transport',
+    scheduler: 'running',
+    taskDispatch: 'unavailable_no_handlers',
+    httpApi: 'not_implemented',
+    healthEndpoint: 'not_implemented',
+  },
+);

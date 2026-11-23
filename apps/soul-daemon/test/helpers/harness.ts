@@ -28,6 +28,24 @@ export const DAEMON_ENTRY = join(APP_ROOT, 'dist', 'main.js');
 
 export const SIGNAL_RUNNER = join(APP_ROOT, 'test', 'fixtures', 'signal-runner.mjs');
 
+/** Required task policy. Production config has no default for these two. */
+export const TEST_POLICY_ENV: Record<string, string> = {
+  SOUL_TASK_MAX_ATTEMPTS: '3',
+  SOUL_TASK_RETRY_BACKOFF_MS: '1000',
+};
+
+/**
+ * Spawns that already name a data directory must also pass the required policy.
+ * A spawn with no `SOUL_DATA_DIR` is left unchanged, so the missing-directory
+ * case still fails on that variable alone.
+ */
+function withRequiredPolicy(env: Record<string, string>): Record<string, string> {
+  if (env['SOUL_DATA_DIR'] === undefined) {
+    return env;
+  }
+  return { ...TEST_POLICY_ENV, ...env };
+}
+
 export interface LogRecord {
   readonly [key: string]: unknown;
 }
@@ -94,7 +112,7 @@ export function spawnDaemon(options: SpawnOptions): SpawnedDaemon {
   const entry = options.entry ?? DAEMON_ENTRY;
   const child = spawn(process.execPath, [entry], {
     cwd: REPO_ROOT,
-    env: { ...process.env, ...options.env },
+    env: { ...process.env, ...withRequiredPolicy(options.env) },
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   });

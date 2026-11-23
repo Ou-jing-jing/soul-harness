@@ -22,6 +22,12 @@ export const DAEMON_ERROR_CODES = [
   // lifecycle
   'startup_aborted',
   'startup_failed',
+  // Reserved for later SH-008E phases. E1 does not raise these.
+  'persona_recovery_failed',
+  'runtime_recovery_failed',
+  'recovery_incomplete',
+  'event_bus_start_failed',
+  'scheduler_start_failed',
   'shutdown_failed',
   'invalid_transition',
 ] as const;
