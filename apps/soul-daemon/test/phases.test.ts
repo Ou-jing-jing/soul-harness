@@ -9,7 +9,7 @@ import {
 } from '../src/phases.js';
 
 describe('startup steps stay honest', () => {
-  it('keeps the step ids and does not mark the scheduler implemented', () => {
+  it('marks recovery, ingress, and the scheduler implemented, and leaves http alone', () => {
     expect(STARTUP_STEPS.map((step) => step.id)).toStrictEqual([
       'config',
       'logging',
@@ -25,10 +25,10 @@ describe('startup steps stay honest', () => {
       'http_api',
       'health_check',
     ]);
-    for (const id of ['persona_recovery', 'runtime_recovery']) {
+    for (const id of ['persona_recovery', 'runtime_recovery', 'event_bus', 'scheduler']) {
       expect(STARTUP_STEPS.find((step) => step.id === id)?.status).toBe('implemented');
     }
-    for (const id of ['event_bus', 'scheduler', 'http_api', 'health_check']) {
+    for (const id of ['http_api', 'health_check']) {
       expect(STARTUP_STEPS.find((step) => step.id === id)?.status).toBe('not_implemented');
     }
     expect(STARTUP_STEPS.find((step) => step.id === 'http_api')?.owner).toBe('SH-009');

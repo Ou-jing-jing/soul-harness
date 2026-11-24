@@ -112,7 +112,7 @@ function assertClosed(dir: string, records: LogRecord[]): void {
 }
 
 describe('RECOVERING assembly', () => {
-  it('recovers an empty database and does not assemble a scheduler', async () => {
+  it('recovers an empty database and starts a scheduler that does not dispatch', async () => {
     const dir = tempDir();
     const { daemon, records } = boot(dir);
     const report = await daemon.start();
@@ -124,7 +124,15 @@ describe('RECOVERING assembly', () => {
       tasksFailed: 0,
       eventsExpired: 0,
     });
-    expect(report.components.scheduler.state).toBe('absent');
+    expect(report.components.scheduler).toEqual({
+      assembled: true,
+      started: true,
+      state: 'running',
+      handlerKinds: 0,
+      dispatchesTasks: false,
+    });
+    expect(report.components.eventBus.acceptsInput).toBe(false);
+    expect(report.components.eventBus.transport).toBe('none');
     expect(report.components.personaLifecycle.autoStarted).toBe(false);
     expect(daemon.status.bootId).toBe(report.bootId);
 
@@ -134,9 +142,7 @@ describe('RECOVERING assembly', () => {
     const again = await second.daemon.start();
     expect(again.recovery).toEqual(report.recovery);
     await second.daemon.stop('done');
-    expect(records.some((record) => String(record['event']).includes('scheduler_started'))).toBe(
-      false,
-    );
+    expect(records.some((record) => record['event'] === 'scheduler_started')).toBe(true);
   });
 
   it('normalizes crashed personas, converges tasks and events, and does not start personas', async () => {
@@ -173,7 +179,8 @@ describe('RECOVERING assembly', () => {
     expect(readTask(dir, 2, 3)).toMatchObject({ state: 'failed', attempt: 3, runId: cappedRun });
     expect(readEvent(dir, 1, 3)).toMatchObject({ status: 'expired', statusReason: 'buffer_lost' });
     expect(readEvent(dir, 2, 3)).toMatchObject({ status: 'expired', statusReason: 'buffer_lost' });
-    expect(report.components.scheduler.assembled).toBe(false);
+    expect(report.components.scheduler.assembled).toBe(true);
+    expect(report.components.scheduler.dispatchesTasks).toBe(false);
     expect(JSON.stringify(records)).not.toContain('SECRET-NAME');
 
     await daemon.stop('done');
@@ -379,7 +386,11 @@ describe('daemon-reproducible incomplete reasons', () => {
       attempt: 1,
       runId: before?.runId,
     });
-    expect(daemon.status.components.scheduler.assembled).toBe(false);
+    expect(daemon.status.components.scheduler).toMatchObject({
+      assembled: true,
+      state: 'running',
+      dispatchesTasks: false,
+    });
     await daemon.stop('done');
   });
 
