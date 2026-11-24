@@ -7,10 +7,10 @@
  * object, or a field name the daemon does not use.
  *
  * Field names are default-deny. A key is written only when it is on the
- * operational allowlist; every other key is kept so the drop is visible, but
- * its value is replaced with `[redacted]` and not walked. Allowlisted keys
- * whose names still look like content (`token`, `content`, `payload`, …) are
- * redacted too.
+ * operational allowlist; every other key is dropped entirely, including its
+ * name, so a secret cannot be published through the key itself. Allowlisted
+ * keys whose names still look like content (`token`, `content`, `payload`, …)
+ * are redacted too.
  *
  * A matching name is not enough for a value that can come from outside the
  * process. `source` and `adapterId` stay redacted until the adapter registry
