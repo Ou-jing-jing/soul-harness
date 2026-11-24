@@ -54,7 +54,8 @@ const LEVEL_WEIGHT: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, err
 
 /**
  * Operational fields the daemon and the runtime actually emit.
- * Anything else is untrusted free text, whatever its key is called.
+ * Any other name is omitted. The name is not copied into the line: a caller
+ * can put the secret in the field name itself.
  */
 const ALLOWED_LOG_KEYS: ReadonlySet<string> = new Set([
   'acceptsInput',
@@ -482,6 +483,11 @@ function sanitizeValue(value: unknown, depth: number, key?: string): unknown {
 function sanitizeRecord(record: Record<string, unknown>, depth: number): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(record)) {
+    if (!ALLOWED_LOG_KEYS.has(key)) {
+      // Drop the property. Keeping the name with a redacted value would still
+      // publish a secret that was placed in the key.
+      continue;
+    }
     if (key === 'source' || key === 'adapterId') {
       // No adapter registry is implemented. A pattern match is not registration.
       result[key] = REDACTED;
@@ -497,7 +503,7 @@ function sanitizeRecord(record: Record<string, unknown>, depth: number): Record<
       result[key] = value instanceof Error ? errorValue(value) : REDACTED;
       continue;
     }
-    if (!ALLOWED_LOG_KEYS.has(key) || REDACTED_KEY.test(key)) {
+    if (REDACTED_KEY.test(key)) {
       result[key] = REDACTED;
       continue;
     }
