@@ -4,7 +4,10 @@
  * Implements the infrastructure half of RUNTIME-LIFECYCLE §2/§3 and nothing else:
  *
  *   BOOTING → MIGRATING → RECOVERING → READY → RUNNING
- *   RUNNING → DRAINING → CHECKPOINTING → CLOSING → STOPPED
+ *   RUNNING → DRAINING → CLOSING → STOPPED
+ *
+ * Checkpoint is not a phase this process enters. The step is logged as
+ * `checkpoint_skipped` and nothing is written.
  *
  * What is real: configuration, structured logging, data-directory probe, the
  * single-instance lock, opening SQLite, running migrations, verifying the
@@ -18,8 +21,10 @@
  * awaited, and only then is the store closed and the instance lock released.
  * `SOUL_SHUTDOWN_TIMEOUT_MS` is not a deadline. Cleanup failures are collected
  * and reported instead of being swallowed. A broken cleanup must never look
- * like a clean shutdown. What happens after `Store.close()` itself throws is
- * unchanged and is not a new lock policy.
+ * like a clean shutdown. If `scheduler.stop()` rejects, the store stays open
+ * and the lock stays held. If `Store.close()` throws, the instance lock is
+ * not released (D-E4-LOCK-1), including on a later cleanup pass. The next
+ * start takes the stale lock.
  */
 
 import { join } from 'node:path';
@@ -134,6 +139,20 @@ function createDeferred<T>(): Deferred<T> {
   };
 }
 
+/**
+ * A close failure recorded on an earlier pass is not in this pass's steps.
+ * The shutdown result still has to say `sqlite_open` failed.
+ */
+function withStoreCloseFailure(
+  steps: readonly StepOutcome[],
+  storeCloseFailed: boolean,
+): StepOutcome[] {
+  if (!storeCloseFailed || steps.some((entry) => entry.step === 'sqlite_open')) {
+    return [...steps];
+  }
+  return [...steps, { step: 'sqlite_open', status: 'failed', code: 'shutdown_failed' }];
+}
+
 export class SoulDaemon {
   readonly #config: DaemonConfig;
   readonly #logger: Logger;
@@ -155,6 +174,9 @@ export class SoulDaemon {
   #startPromise: Promise<StartReport> | null = null;
   #stopPromise: Promise<StopReport> | null = null;
   #lastStopReport: StopReport | null = null;
+  #schedulerStopFailed = false;
+  /** `Store.close()` threw. A later pass must not call `lock.release()`. */
+  #storeCloseFailed = false;
 
   readonly #shutdownDone = createDeferred<StopReport>();
 
@@ -357,7 +379,6 @@ export class SoulDaemon {
     }
 
     const ranForReal = this.#phase === 'RUNNING' || this.#phase === 'READY';
-    const steps: StepOutcome[] = [];
 
     if (ranForReal) {
       this.#enter('DRAINING');
@@ -376,24 +397,31 @@ export class SoulDaemon {
 
     // Checkpointing is only legal when a runtime exists to produce one. Writing a
     // placeholder would fabricate state, so the step is reported as skipped.
+    // There is no drain and no shutdown deadline.
     this.#logger.info('checkpoint_skipped', { reason: 'runtime_not_implemented' });
 
+    const steps: StepOutcome[] = [];
+    this.#closeIngress(steps);
+    const schedulerFailed = await this.#stopScheduler(steps);
+    if (schedulerFailed || this.#schedulerStopFailed) {
+      // The scheduler may still be inside the store. Do not close it and do
+      // not drop the lock just because stop rejected.
+      throw this.#rejectShutdown(steps);
+    }
+
     this.#enter('CLOSING');
-    steps.push(...(await this.#releaseAll()));
+    this.#releaseStoreAndLock(steps);
 
     this.#enter('STOPPED');
-    const report: StopReport = { phase: 'STOPPED', reason, steps };
+    const reported = withStoreCloseFailure(steps, this.#storeCloseFailed);
+    const report: StopReport = { phase: 'STOPPED', reason, steps: reported };
     this.#lastStopReport = report;
 
-    const failures = steps.filter((entry) => entry.status === 'failed');
+    const failures = reported.filter((entry) => entry.status === 'failed');
     this.#logger.info('daemon_stopped', { reason, cleanupFailures: failures.length });
 
     if (failures.length > 0) {
-      const error = new DaemonError('shutdown_failed', 'daemon stopped with cleanup failures', {
-        details: { failures: failures.length, first: failures[0]?.step ?? 'unknown' },
-      });
-      this.#shutdownDone.reject(error);
-      throw error;
+      throw this.#rejectShutdown(reported);
     }
 
     this.#shutdownDone.resolve(report);
@@ -402,39 +430,64 @@ export class SoulDaemon {
 
   async #releaseAll(): Promise<StepOutcome[]> {
     const outcomes: StepOutcome[] = [];
+    this.#closeIngress(outcomes);
+    const schedulerFailed = await this.#stopScheduler(outcomes);
+    if (!schedulerFailed && !this.#schedulerStopFailed) {
+      this.#releaseStoreAndLock(outcomes);
+    }
+    return outcomes;
+  }
 
-    // Ingress first, then the scheduler, then the store and the lock.
-    // `scheduler.stop()` must settle before `Store.close()`. Nothing here
-    // reads `shutdownTimeoutMs`, and a close failure still falls through to
-    // the lock the same way it did before this phase.
+  #closeIngress(outcomes: StepOutcome[]): void {
     const ingress = this.#ingress;
     this.#ingress = null;
-    if (ingress !== null) {
-      try {
-        ingress.close();
-        outcomes.push({ step: 'event_bus', status: 'ok' });
-      } catch (error) {
-        const code = isDaemonError(error) ? error.code : 'shutdown_failed';
-        outcomes.push({ step: 'event_bus', status: 'failed', code });
-        this.#logger.error('cleanup_failed', { step: 'event_bus', code });
-      }
+    if (ingress === null) {
+      return;
     }
+    try {
+      ingress.close();
+      outcomes.push({ step: 'event_bus', status: 'ok' });
+    } catch (error) {
+      const code = isDaemonError(error) ? error.code : 'shutdown_failed';
+      outcomes.push({ step: 'event_bus', status: 'failed', code });
+      this.#logger.error('cleanup_failed', { step: 'event_bus', code });
+    }
+  }
 
+  /** Resolves `true` when stop rejected. The store must then stay open. */
+  async #stopScheduler(outcomes: StepOutcome[]): Promise<boolean> {
     const scheduler = this.#scheduler;
     this.#scheduler = null;
-    if (scheduler !== null) {
-      try {
-        await scheduler.stop();
-        outcomes.push({ step: 'scheduler', status: 'ok' });
-      } catch (error) {
-        const code = isDaemonError(error) ? error.code : 'shutdown_failed';
-        outcomes.push({ step: 'scheduler', status: 'failed', code });
-        this.#logger.error('cleanup_failed', { step: 'scheduler', code });
-      }
+    if (scheduler === null) {
+      return false;
     }
+    try {
+      await scheduler.stop();
+      outcomes.push({ step: 'scheduler', status: 'ok' });
+      return false;
+    } catch (error) {
+      const code = isDaemonError(error) ? error.code : 'shutdown_failed';
+      outcomes.push({ step: 'scheduler', status: 'failed', code });
+      this.#logger.error('cleanup_failed', { step: 'scheduler', code });
+      this.#schedulerStopFailed = true;
+      return true;
+    }
+  }
+
+  /**
+   * Store, then lock. A thrown `Store.close()` skips `lock.release()` so the
+   * next process cannot open a file this process failed to close cleanly.
+   */
+  #releaseStoreAndLock(outcomes: StepOutcome[]): void {
+    let storeCloseFailed = this.#storeCloseFailed;
+    const retained: Resource[] = [];
 
     for (const resource of [...this.#resources].reverse()) {
       if (resource.released) {
+        continue;
+      }
+      if (resource.step === 'instance_lock' && storeCloseFailed) {
+        retained.push(resource);
         continue;
       }
       resource.released = true;
@@ -446,11 +499,15 @@ export class SoulDaemon {
         const code = isDaemonError(error) ? error.code : 'shutdown_failed';
         outcomes.push({ step: resource.step, status: 'failed', code });
         this.#logger.error('cleanup_failed', { step: resource.step, code });
+        if (resource.step === 'sqlite_open') {
+          storeCloseFailed = true;
+          this.#storeCloseFailed = true;
+        }
       }
     }
 
-    this.#resources = [];
-    if (outcomes.some((entry) => entry.step === 'instance_lock')) {
+    this.#resources = retained;
+    if (outcomes.some((entry) => entry.step === 'instance_lock' && entry.status === 'ok')) {
       this.#lock = null;
     }
     if (outcomes.some((entry) => entry.step === 'sqlite_open')) {
@@ -458,8 +515,15 @@ export class SoulDaemon {
       this.#lifecycle = null;
       this.#surface = CURRENT_RUNTIME_SURFACE;
     }
+  }
 
-    return outcomes;
+  #rejectShutdown(steps: readonly StepOutcome[]): DaemonError {
+    const failures = steps.filter((entry) => entry.status === 'failed');
+    const error = new DaemonError('shutdown_failed', 'daemon stopped with cleanup failures', {
+      details: { failures: failures.length, first: failures[0]?.step ?? 'unknown' },
+    });
+    this.#shutdownDone.reject(error);
+    return error;
   }
 
   /**
