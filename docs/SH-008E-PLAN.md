@@ -1,6 +1,7 @@
 # SH-008E — Daemon 集成与验收：规划任务书
 
 - **文档状态**：E0.R1 规划修订，等待本修订的独立复审。**不是实施授权**，不表示 SH-008E 已开始或已完成，不得据此开始 E1。
+  > **当前实施状态（2026-11）**：E1–E5、AUDIT-001 与 E6 README 同步已经完成并合并；本文正文中“等待复审 / E1 未开始 / E4 锁策略待决”等文字是历史阶段记录，不再作为当前要求。当前实施状态以文末 **§19 实施状态同步（E1–E6，2026-11）** 为准；该节不改变任何已批准架构决议。
 - **开工基线**：远端 `main` HEAD `d451f90d20c6acea4af298b52f6041b08b12e90c`（2026-11-23，PR #8 并入本文件的初稿）。该提交相对 `8bd7f9e904e87135d10d0a4df14c7fdce319ecf1` 只新增本文件；生产代码与 `8bd7f9e` 相同。
 - **E0 代码审计基线**：`8bd7f9e904e87135d10d0a4df14c7fdce319ecf1`（O-0 文档状态同步）。审计结论见本修订；不修改 Runtime / Persistence / Contracts。
 - **历史规划基线**：初稿曾以 `4f290e8607633db5a6f19ce9209f9edf42a9dc5c`（D4.R1）为 HEAD。该提交仍是 `8bd7f9e` 的父提交，但不再是本文件的开工基线。
@@ -506,6 +507,8 @@ interface DaemonStatus {
 
 ### 7.6 E4 待决：`Store.close()` 失败后的 Instance Lock
 
+> **历史状态（已取代）**：本节“E4 待决 / 不批准任何策略”的描述属于当时状态；D-E4-LOCK-1 已批准并实施。当前语义见 §19.2。
+
 **【事实】** 当前 `packages/persistence` 的 `Store.close()` 在调用驱动 `database.close()` **之前**就把该实例记入已关闭集合并丢掉句柄。驱动关闭若抛错，异常会传出，但进程内这个 Store 已经不会再被使用。
 
 **【事实】** 当前 `apps/soul-daemon` 的 `#releaseAll` 按获取的逆序释放，顺序是先 `store.close()` 后 `lock.release()`。某一步抛错会被记下，循环继续。因此今天若 `Store.close()` 抛错，Instance Lock **仍会被释放**。下一个进程可以按“目录上没有锁”打开同一个数据库文件，而前一次关闭并没有成功返回。
@@ -1001,6 +1004,8 @@ const policy = Object.freeze({
 
 ## 17. 开工条件与结论
 
+> **历史状态（已取代）**：本节“尚未获实施授权 / E1 未开始 / 锁策略未决”的记录是规划阶段状态；当前已实施至 E5，状态见 §19.1、§19.2。
+
 **【本次建议的结论】**
 
 ### 17.1 开工条件（必须按顺序满足）
@@ -1027,3 +1032,95 @@ const policy = Object.freeze({
 - 未开始 E1，未开始 SH-009，未创建实施分支。
 - 未改 D-R1–D-R3 或 O-0–O-11。未为 §7.6 选择策略。
 - E0.R1 的提交只提供本修订供独立复审，不是实施授权。
+
+---
+
+## 19. 实施状态同步（E1–E6，2026-11）
+
+> **性质与效力**：本节是当前实施状态的权威补充，只记录已经发生的实施、合并和测试事实，不新增架构决议，也不改变原计划中的已确认决议。就“当前实施状态”而言，本节与正文中标注为历史状态的旧文字冲突时，以本节为准；架构决议本身仍以原 §16.2 及已批准决议为准，本节不改写其含义。
+>
+> 本节不把“阶段已合并”写成“SH-008E 整批已验收”。SH-008E 的整批最终验收仍待独立复审。
+
+### 19.1 阶段状态与合并事实
+
+基线事实：本节同步时的 `main` 为 `cc00bfb344cf4b68a34cd99cc92b73351b5f2d82`，即 E6 README 同步 PR #21 的合并提交。
+
+| 阶段 | 当前状态 |
+|---|---|
+| E0 | 已完成并合并（PR #9） |
+| E1 | 已完成并合并（PR #10） |
+| E2 | 已完成并合并（PR #11） |
+| E3 | 已完成并合并（PR #13） |
+| E4 | 已完成并合并（PR #18） |
+| E5 | 已完成并合并（PR #19） |
+| AUDIT-001 | 已完成并合并（PR #14；R1 修复 PR #20） |
+| E6 README 同步 | 已完成并合并（PR #21，合并提交 `cc00bfb`） |
+| E6 计划文档状态同步 | 当前任务：本补充章节；PR 待独立复审 |
+| SH-008E 整批验收 | **尚未签署**；等待独立最终验收 |
+
+### 19.2 D-E4-LOCK-1：已批准并已实施
+
+`Store.close()` 失败后的 Instance Lock 策略已经由 **D-E4-LOCK-1** 决定并实施：
+
+- `Store.close()` 失败时保留 Instance Lock；
+- 不调用 `lock.release()`；
+- 锁文件保留，后续启动按既有 stale-lock 协议处理，不把未成功关闭的数据库视为可安全接管；
+- 关闭结果报告 `shutdown_failed`，退出码 6；
+- 该策略已在 E4 实施，并有对应测试覆盖；
+- 测试通过 wrapper 在实际 close 之后抛错来模拟该路径，**不应**声称完整模拟 SQLite 原生底层的所有 close 失败方式。
+
+本节不改变 D-E4-LOCK-1 的含义。原计划中将该策略描述为“尚未决议”“E4 待决”“不得提前实施”或“不得选择其中一种”的文字，属于历史阶段状态，不再是当前有效要求；原文保留用于追溯。
+
+### 19.3 Shutdown 当前语义
+
+已经批准并实施的关闭顺序：
+
+```text
+ingress.close()
+  → await scheduler.stop()
+  → Store.close()
+  → Instance Lock release
+```
+
+当前语义：
+
+- `Ingress.close()` 失败时仍继续后续清理，并报告 `shutdown_failed`；
+- `Scheduler.stop()` reject 时停留在 `DRAINING`，不关闭 Store，不释放 Instance Lock；
+- `Scheduler.stop()` 一直 pending 时不关库、不放锁；没有强制关闭上界；
+- `Store.close()` 失败时保留 Instance Lock（D-E4-LOCK-1）；
+- `SOUL_SHUTDOWN_TIMEOUT_MS` 只有配置和校验，不具有关闭 deadline、强制取消 Scheduler 或放弃等待的语义。
+
+原计划中关于同步释放循环、`Store.close()` 失败后仍释放锁、或在超时后强制关库的描述，都是已被后续实施取代的历史语义，不再是当前要求。D-R1 的“不设置强制关闭上界”仍然有效。
+
+### 19.4 E1–E5 已实施的总体能力边界
+
+- Daemon 已完成配置、启动、RECOVERING、READY 装配和关闭流程。
+- Recovery 在 `incomplete !== null` 时 fail closed；不创建 Ingress / Scheduler；部分已提交的行保留，重启后可继续且不重复处理已收敛行。
+- Ingress 没有 transport；`acceptsInput=false`，不代表已经能够接收外部真实输入。
+- Scheduler 使用固定空 Handler Map：`handlerKinds=0`，`taskDispatch=unavailable_no_handlers`，不派发实际业务任务。
+- Persona 生命周期已装配，但不自动启动 Persona（`autoStarted=false`）。
+- 没有 HTTP API、Health endpoint、Supervisor 或 health loop。
+- 没有强制取消在途 Handler 的保证，也没有有界 Shutdown 保证。
+- 当前运行能力与配置的详细说明见 `apps/soul-daemon/README.md`；本节不把该 README 的能力边界扩展成新的架构决议。
+
+### 19.5 过时状态与历史内容的对照
+
+以下旧文字保留在原位，作为历史规划和审查记录；它们不再作为当前实施要求。仍然有效的架构原则继续有效，不因本节而失效。
+
+| 位置 | 旧状态 / 旧语义 | 当前事实 |
+|---|---|---|
+| 文档顶部“文档状态” | E0.R1 等待独立复审；不表示已开始；不得开始 E1 | E1–E5、AUDIT-001、E6 README 已完成并合并；E6.R2 待复审 |
+| §7.6 | `Store.close()` 失败后的锁策略是 E4 待决项；不批准任何选择 | D-E4-LOCK-1 已批准并实施：close 失败保留 Instance Lock |
+| §7 / §12 中旧释放循环描述 | 同步逆序释放；某步抛错后循环继续，close 失败仍可能放锁 | E4 已改为异步释放栈；Store.close 失败时不放锁 |
+| §11 E0 / §17 / §18 | 尚未取得实施授权；E1 未开始；不创建实施分支 | E1–E5 已完成并合并；E6 进行中 |
+| §11 E4 | 在独立复审选定策略前不得实现任何锁策略 | 已按 D-E4-LOCK-1 实现并测试 |
+| §13 验收 / §16 风险表 | close 失败后的锁行为仍未决，验收不得写成已通过 | 已决议、已实施、已有测试；整批验收仍待最终签署 |
+
+### 19.6 本补充没有做的事
+
+- 不修改 `apps/soul-daemon/**`、Runtime、Persistence、Contracts、Migration、依赖或 CI；
+- 不修改 `apps/soul-daemon/README.md` 或其他文档；
+- 不改变 D-R1–D-R3、O-0–O-11、D-E4-LOCK-1 或其他已批准决议的含义；
+- 不新增架构能力，不开始 SH-009；
+- 不把 SH-008E 宣告为整批验收通过；
+- 不删除任何历史决策、审查意见或实施记录。
