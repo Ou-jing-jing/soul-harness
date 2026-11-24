@@ -772,6 +772,131 @@ describe('settlement', () => {
     ).resolves.toBeDefined();
   });
 
+  function installSettleTrigger(fixture: Fixture, when: string): void {
+    withWrite(fixture.store, (tx) => {
+      tx.prepare(
+        `CREATE TEMP TRIGGER audit_settle_block BEFORE UPDATE ON tasks WHEN ${when} BEGIN SELECT RAISE(ABORT, 'transient settle failure'); END`,
+      ).run();
+    });
+  }
+
+  function dropSettleTrigger(fixture: Fixture): void {
+    withWrite(fixture.store, (tx) => {
+      tx.prepare('DROP TRIGGER IF EXISTS audit_settle_block').run();
+    });
+  }
+
+  it('retries a completion that failed to commit without running the handler again', async () => {
+    const fixture = openFixture();
+    seedPersona(fixture, 1);
+    seedTask(fixture, 1);
+    installSettleTrigger(fixture, "NEW.state = 'done'");
+    let calls = 0;
+    const { entries, logger } = captureLogs();
+    const scheduler = makeScheduler(fixture, {
+      logger,
+      handlers: {
+        'thought.run': () => {
+          calls += 1;
+        },
+      },
+    });
+
+    scheduler.start();
+    await flushAll();
+
+    const stuck = taskRow(fixture, 1);
+    expect(stuck).toMatchObject({ state: 'running', attempt: 1 });
+    expect(calls).toBe(1);
+    expect(entries.some((entry) => entry.event === 'scheduler_settle_failed')).toBe(true);
+    expect(JSON.stringify(entries)).not.toContain('transient settle failure');
+    expect(fixture.timers.size).toBe(1);
+
+    dropSettleTrigger(fixture);
+    fixture.timers.fireNext();
+    await flushAll();
+
+    expect(calls).toBe(1);
+    expect(taskRow(fixture, 1)).toMatchObject({
+      state: 'done',
+      attempt: 1,
+      runId: stuck?.runId,
+      finishedAt: fixture.clock.value,
+    });
+    expect(entries.some((entry) => entry.event === 'scheduler_settle_recovered')).toBe(true);
+  });
+
+  it('retries a failure settle that failed to commit and does not rerun the handler', async () => {
+    const fixture = openFixture();
+    seedPersona(fixture, 1);
+    seedTask(fixture, 1);
+    installSettleTrigger(fixture, "NEW.state = 'queued'");
+    let calls = 0;
+    const scheduler = makeScheduler(fixture, {
+      policy: { maxAttempts: 3, retryBackoffMs: 500 },
+      handlers: {
+        'thought.run': () => {
+          calls += 1;
+          throw new Error('handler boom');
+        },
+      },
+    });
+
+    scheduler.start();
+    await flushAll();
+
+    const stuck = taskRow(fixture, 1);
+    expect(stuck).toMatchObject({ state: 'running', attempt: 1 });
+    expect(calls).toBe(1);
+    expect(JSON.stringify(stuck)).not.toContain('handler boom');
+
+    dropSettleTrigger(fixture);
+    fixture.timers.fireNext();
+
+    expect(calls).toBe(1);
+    expect(taskRow(fixture, 1)).toMatchObject({
+      state: 'queued',
+      attempt: 1,
+      runId: stuck?.runId,
+      scheduledAt: fixture.clock.value + 500,
+    });
+  });
+
+  it('leaves a task RUNNING when a settle retry never commits', async () => {
+    const fixture = openFixture();
+    seedPersona(fixture, 1);
+    seedTask(fixture, 1);
+    installSettleTrigger(fixture, "NEW.state = 'done'");
+    let calls = 0;
+    const { entries, logger } = captureLogs();
+    const scheduler = makeScheduler(fixture, {
+      logger,
+      handlers: {
+        'thought.run': () => {
+          calls += 1;
+        },
+      },
+    });
+
+    scheduler.start();
+    await flushAll();
+    const stuck = taskRow(fixture, 1);
+    expect(stuck?.state).toBe('running');
+
+    await scheduler.stop();
+
+    expect(calls).toBe(1);
+    expect(scheduler.state).toBe('stopped');
+    expect(fixture.timers.size).toBe(0);
+    expect(taskRow(fixture, 1)).toMatchObject({
+      state: 'running',
+      attempt: 1,
+      runId: stuck?.runId,
+    });
+    expect(entries.some((entry) => entry.event === 'scheduler_settle_abandoned')).toBe(true);
+    expect(JSON.stringify(entries)).not.toContain('transient settle failure');
+  });
+
   it('Recovery requeues a crashed run without bumping attempt', async () => {
     const fixture = openFixture();
     seedPersona(fixture, 1);

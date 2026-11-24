@@ -13,6 +13,10 @@
  *   P6  event-driven wake + one-shot earliest-due timer
  *   P7  Store-scoped Recovery/Scheduler lease
  *   P8  lease is taken at creation; released only when stop completes
+ *
+ * A settle write that throws is remembered and retried with the same CAS.
+ * The handler is not run again. If stop finishes before a retry commits, the
+ * row stays RUNNING so the next boot's Recovery can requeue it.
  */
 
 import { CHANNELS } from '@soul-harness/contracts';
@@ -331,6 +335,8 @@ export function createScheduler(options: SchedulerOptions): TaskScheduler {
   let pendingWake = false;
   let pumpRunning = false;
   let dueTimer: unknown = undefined;
+  let settleTimer: unknown = undefined;
+  let wake: () => void = () => undefined;
   let leaseReleased = false;
 
   interface Inflight {
@@ -357,6 +363,117 @@ export function createScheduler(options: SchedulerOptions): TaskScheduler {
     }
   };
 
+  const SETTLE_RETRY_BASE_MS = 25;
+  const SETTLE_RETRY_MAX_MS = 5_000;
+
+  interface PendingSettle {
+    readonly entry: Inflight;
+    readonly op: 'complete' | 'fail';
+    readonly finishedAt: number;
+    readonly nextScheduledAt: number | null;
+    attempts: number;
+    lastCode: string;
+  }
+
+  const pendingSettles = new Map<string, PendingSettle>();
+
+  const settleRetryDelay = (attempts: number): number => {
+    const shift = Math.min(attempts, 8);
+    return Math.min(SETTLE_RETRY_MAX_MS, SETTLE_RETRY_BASE_MS * 2 ** shift);
+  };
+
+  const scheduleSettleRetry = (): void => {
+    if (state !== 'running' || pendingSettles.size === 0 || settleTimer !== undefined) {
+      return;
+    }
+    let attempts = 0;
+    for (const item of pendingSettles.values()) {
+      if (item.attempts > attempts) {
+        attempts = item.attempts;
+      }
+    }
+    settleTimer = cfg.timers.setTimeout(() => {
+      settleTimer = undefined;
+      if (state !== 'running') {
+        return;
+      }
+      flushPendingSettles();
+    }, settleRetryDelay(attempts));
+  };
+
+  const applyPending = (item: PendingSettle): 'applied' | 'conflict' | 'failed' => {
+    try {
+      if (item.op === 'complete') {
+        const updated = repos.tasks.completeTask({
+          id: item.entry.taskId,
+          personaId: item.entry.personaId,
+          runId: item.entry.runId,
+          expectedAttempt: item.entry.attempt,
+          finishedAt: item.finishedAt,
+        });
+        return updated === null ? 'conflict' : 'applied';
+      }
+      const failed = repos.tasks.failTask({
+        id: item.entry.taskId,
+        personaId: item.entry.personaId,
+        runId: item.entry.runId,
+        expectedAttempt: item.entry.attempt,
+        maxAttempts: cfg.policy.maxAttempts,
+        retry: true,
+        finishedAt: item.finishedAt,
+        nextScheduledAt: item.nextScheduledAt,
+      });
+      return failed === null ? 'conflict' : 'applied';
+    } catch (error) {
+      item.lastCode = errorCode(error);
+      return 'failed';
+    }
+  };
+
+  const flushPendingSettles = (): void => {
+    if (state === 'stopped') {
+      return;
+    }
+    for (const item of [...pendingSettles.values()]) {
+      const outcome = applyPending(item);
+      if (outcome === 'applied') {
+        pendingSettles.delete(item.entry.taskId);
+        safeLog(cfg.logger, 'info', 'scheduler_settle_recovered', {
+          personaId: item.entry.personaId,
+          taskId: item.entry.taskId,
+          attempt: item.entry.attempt,
+        });
+        if (item.op === 'fail') {
+          wake();
+        }
+      } else if (outcome === 'conflict') {
+        pendingSettles.delete(item.entry.taskId);
+        safeLog(cfg.logger, 'warn', 'scheduler_settle_conflict', {
+          personaId: item.entry.personaId,
+          taskId: item.entry.taskId,
+          attempt: item.entry.attempt,
+          code: 'concurrent_modification',
+        });
+      } else {
+        item.attempts += 1;
+      }
+    }
+    if (pendingSettles.size > 0 && state === 'running') {
+      scheduleSettleRetry();
+    }
+  };
+
+  const rememberSettle = (item: PendingSettle): void => {
+    pendingSettles.set(item.entry.taskId, item);
+    safeLog(cfg.logger, 'error', 'scheduler_settle_failed', {
+      personaId: item.entry.personaId,
+      taskId: item.entry.taskId,
+      attempt: item.entry.attempt,
+      code: item.lastCode,
+    });
+    scheduleSettleRetry();
+  };
+
   const settleFailure = (entry: Inflight, error: unknown): void => {
     if (state === 'stopped') {
       safeLog(cfg.logger, 'warn', 'scheduler_late_result_discarded', {
@@ -370,8 +487,8 @@ export function createScheduler(options: SchedulerOptions): TaskScheduler {
       attempt: entry.attempt,
       code: errorCode(error),
     });
+    const finishedAt = clock();
     try {
-      const now = clock();
       const failed = repos.tasks.failTask({
         id: entry.taskId,
         personaId: entry.personaId,
@@ -379,8 +496,8 @@ export function createScheduler(options: SchedulerOptions): TaskScheduler {
         expectedAttempt: entry.attempt,
         maxAttempts: cfg.policy.maxAttempts,
         retry: true,
-        finishedAt: now,
-        nextScheduledAt: now + cfg.policy.retryBackoffMs,
+        finishedAt,
+        nextScheduledAt: finishedAt + cfg.policy.retryBackoffMs,
       });
       if (failed === null) {
         // CAS miss: the row moved on. Report it, never write an unconditional
@@ -393,12 +510,14 @@ export function createScheduler(options: SchedulerOptions): TaskScheduler {
         });
       }
     } catch (settleError) {
-      // Keep the real error, do not pretend the task succeeded or failed.
-      safeLog(cfg.logger, 'error', 'scheduler_settle_failed', {
-        personaId: entry.personaId,
-        taskId: entry.taskId,
-        attempt: entry.attempt,
-        code: errorCode(settleError),
+      // Keep the real row. Retry the same fail CAS; do not run the handler again.
+      rememberSettle({
+        entry,
+        op: 'fail',
+        finishedAt,
+        nextScheduledAt: finishedAt + cfg.policy.retryBackoffMs,
+        attempts: 0,
+        lastCode: errorCode(settleError),
       });
     }
   };
@@ -410,13 +529,14 @@ export function createScheduler(options: SchedulerOptions): TaskScheduler {
       });
       return;
     }
+    const finishedAt = clock();
     try {
       const updated = repos.tasks.completeTask({
         id: entry.taskId,
         personaId: entry.personaId,
         runId: entry.runId,
         expectedAttempt: entry.attempt,
-        finishedAt: clock(),
+        finishedAt,
       });
       if (updated === null) {
         safeLog(cfg.logger, 'warn', 'scheduler_settle_conflict', {
@@ -427,11 +547,14 @@ export function createScheduler(options: SchedulerOptions): TaskScheduler {
         });
       }
     } catch (error) {
-      safeLog(cfg.logger, 'error', 'scheduler_settle_failed', {
-        personaId: entry.personaId,
-        taskId: entry.taskId,
-        attempt: entry.attempt,
-        code: errorCode(error),
+      // Keep the real row. Retry the same complete CAS; do not run the handler again.
+      rememberSettle({
+        entry,
+        op: 'complete',
+        finishedAt,
+        nextScheduledAt: null,
+        attempts: 0,
+        lastCode: errorCode(error),
       });
     }
   };
@@ -531,6 +654,18 @@ export function createScheduler(options: SchedulerOptions): TaskScheduler {
       // A broken timer implementation must not corrupt scheduler state.
     }
     dueTimer = undefined;
+  };
+
+  const clearSettleTimer = (): void => {
+    if (settleTimer === undefined) {
+      return;
+    }
+    try {
+      cfg.timers.clearTimeout(settleTimer);
+    } catch {
+      // A broken timer implementation must not corrupt scheduler state.
+    }
+    settleTimer = undefined;
   };
 
   const scheduleDueTimer = (): void => {
@@ -643,7 +778,7 @@ export function createScheduler(options: SchedulerOptions): TaskScheduler {
     }
   };
 
-  const wake = (): void => {
+  wake = (): void => {
     if (state !== 'running') {
       return;
     }
@@ -707,6 +842,19 @@ export function createScheduler(options: SchedulerOptions): TaskScheduler {
         await Promise.allSettled(pending);
       }
       clearDueTimer();
+      clearSettleTimer();
+      flushPendingSettles();
+      if (pendingSettles.size > 0) {
+        for (const item of pendingSettles.values()) {
+          safeLog(cfg.logger, 'error', 'scheduler_settle_abandoned', {
+            personaId: item.entry.personaId,
+            taskId: item.entry.taskId,
+            attempt: item.entry.attempt,
+            code: item.lastCode,
+          });
+        }
+        pendingSettles.clear();
+      }
       state = 'stopped';
       releaseLeaseOnce();
       safeLog(cfg.logger, 'info', 'scheduler_stopped', { drained: true });
