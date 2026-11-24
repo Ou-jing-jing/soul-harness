@@ -17,6 +17,7 @@ import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { clearTimeout, setTimeout } from 'node:timers';
 
 import {
   ERROR_MESSAGES,
