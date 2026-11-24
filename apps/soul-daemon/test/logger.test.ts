@@ -46,15 +46,21 @@ describe('structured logging', () => {
     });
 
     const record = JSON.parse(lines[0] as string) as Record<string, unknown>;
-    expect(record['token']).toBe('[redacted]');
-    expect(record['content']).toBe('[redacted]');
-    expect(record['payload']).toBe('[redacted]');
-    expect(record['memory']).toBe('[redacted]');
+    const line = lines[0] as string;
     expect(record['phase']).toBe('RUNNING');
-    expect(record['deep']).toBe('[redacted]');
-    expect(lines[0]).not.toContain('secret-token');
-    expect(lines[0]).not.toContain('the persona said hello');
-    expect(lines[0]).not.toContain('memory body');
+    expect(record['token']).toBeUndefined();
+    expect(record['content']).toBeUndefined();
+    expect(record['payload']).toBeUndefined();
+    expect(record['memory']).toBeUndefined();
+    expect(record['deep']).toBeUndefined();
+    expect(line).not.toContain('"token"');
+    expect(line).not.toContain('"content"');
+    expect(line).not.toContain('"payload"');
+    expect(line).not.toContain('"memory"');
+    expect(line).not.toContain('"deep"');
+    expect(line).not.toContain('secret-token');
+    expect(line).not.toContain('the persona said hello');
+    expect(line).not.toContain('memory body');
   });
 
   it('redacts free-text fields that are not on the allowlist', () => {
@@ -71,11 +77,15 @@ describe('structured logging', () => {
     });
 
     const record = JSON.parse(lines[0] as string) as Record<string, unknown>;
-    expect(record['message']).toBe('[redacted]');
-    expect(record['detail']).toBe('[redacted]');
-    expect(record['context']).toBe('[redacted]');
+    const line = lines[0] as string;
+    expect(record['message']).toBeUndefined();
+    expect(record['detail']).toBeUndefined();
+    expect(record['context']).toBeUndefined();
     expect(record['phase']).toBe('RUNNING');
-    expect(lines[0]).not.toContain('amber-otter');
+    expect(line).not.toContain('"message"');
+    expect(line).not.toContain('"detail"');
+    expect(line).not.toContain('"context"');
+    expect(line).not.toContain('amber-otter');
   });
 
   it('does not walk an unknown object far enough to leak a nested value', () => {
@@ -87,9 +97,11 @@ describe('structured logging', () => {
 
     expect(lines[0]).not.toContain('amber-otter');
     expect(lines[0]).not.toContain('sk-live');
+    expect(lines[0]).not.toContain('"context"');
+    expect(lines[0]).not.toContain('"history"');
     const record = JSON.parse(lines[0] as string) as Record<string, unknown>;
-    expect(record['context']).toBe('[redacted]');
-    expect(record['history']).toBe('[redacted]');
+    expect(record['context']).toBeUndefined();
+    expect(record['history']).toBeUndefined();
   });
 
   it('redacts a plain error message while keeping name and a string code', () => {
@@ -255,5 +267,41 @@ describe('structured logging', () => {
       message: '[redacted]',
     });
     expect(lines[0]).not.toContain('amber-otter');
+  });
+
+  it('drops an unknown field name instead of publishing it', () => {
+    const phrase = 'secret-user-email-alice@example.com';
+    const { lines, logger } = capture();
+    logger.info('phase_entered', {
+      phase: 'RUNNING',
+      [phrase]: 'anything',
+    });
+
+    const line = lines[0] as string;
+    const record = JSON.parse(line) as Record<string, unknown>;
+    expect(line).not.toContain(phrase);
+    expect(Object.hasOwn(record, phrase)).toBe(false);
+    expect(record['phase']).toBe('RUNNING');
+    expect(line).toContain('"phase":"RUNNING"');
+  });
+
+  it('drops an unknown field name nested under an allowlisted object', () => {
+    const phrase = 'secret-user-email-alice@example.com';
+    const { lines, logger } = capture();
+    logger.info('phase_entered', {
+      phase: 'RUNNING',
+      step: {
+        status: 'ok',
+        [phrase]: 'alice@example.com',
+      },
+    });
+
+    const line = lines[0] as string;
+    const record = JSON.parse(line) as { phase?: string; step?: Record<string, unknown> };
+    expect(line).not.toContain(phrase);
+    expect(line).not.toContain('alice@example.com');
+    expect(record.phase).toBe('RUNNING');
+    expect(record.step).toStrictEqual({ status: 'ok' });
+    expect(Object.hasOwn(record.step ?? {}, phrase)).toBe(false);
   });
 });
