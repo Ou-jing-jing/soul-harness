@@ -39,7 +39,7 @@ describe('structured logging', () => {
       content: 'the persona said hello',
       payload: { nested: 'memory body' },
       memory: ['a fragment'],
-      safe: 'kept',
+      phase: 'RUNNING',
       deep: { apiKey: 'k', note: 'ok' },
     });
 
@@ -48,8 +48,46 @@ describe('structured logging', () => {
     expect(record['content']).toBe('[redacted]');
     expect(record['payload']).toBe('[redacted]');
     expect(record['memory']).toBe('[redacted]');
-    expect(record['safe']).toBe('kept');
-    expect(record['deep']).toStrictEqual({ apiKey: '[redacted]', note: 'ok' });
+    expect(record['phase']).toBe('RUNNING');
+    expect(record['deep']).toBe('[redacted]');
+    expect(lines[0]).not.toContain('secret-token');
+    expect(lines[0]).not.toContain('the persona said hello');
+    expect(lines[0]).not.toContain('memory body');
+  });
+
+  it('redacts free-text fields that are not on the allowlist', () => {
+    const { lines, logger } = capture();
+    const userInput = 'user said the secret phrase amber-otter';
+    const modelOutput = 'model replied with amber-otter too';
+    const privateConversation = 'private conversation amber-otter';
+
+    logger.info('diagnostic', {
+      message: userInput,
+      detail: modelOutput,
+      context: privateConversation,
+      phase: 'RUNNING',
+    });
+
+    const record = JSON.parse(lines[0] as string) as Record<string, unknown>;
+    expect(record['message']).toBe('[redacted]');
+    expect(record['detail']).toBe('[redacted]');
+    expect(record['context']).toBe('[redacted]');
+    expect(record['phase']).toBe('RUNNING');
+    expect(lines[0]).not.toContain('amber-otter');
+  });
+
+  it('does not walk an unknown object far enough to leak a nested value', () => {
+    const { lines, logger } = capture();
+    logger.info('diagnostic', {
+      context: { cause: { message: 'nested amber-otter', token: 'sk-live' } },
+      history: ['amber-otter'],
+    });
+
+    expect(lines[0]).not.toContain('amber-otter');
+    expect(lines[0]).not.toContain('sk-live');
+    const record = JSON.parse(lines[0] as string) as Record<string, unknown>;
+    expect(record['context']).toBe('[redacted]');
+    expect(record['history']).toBe('[redacted]');
   });
 
   it('redacts a plain error message while keeping name and a string code', () => {
@@ -98,21 +136,16 @@ describe('structured logging', () => {
     expect(line).not.toContain('at ');
   });
 
-  it('redacts errors nested in objects and arrays after serialization', () => {
+  it('redacts an unknown nested key even when it holds an error', () => {
     const { lines, logger } = capture();
     const error = Object.assign(new Error('nested boom'), { code: 'E_NESTED' });
 
-    logger.error('fatal', { context: { cause: error }, history: [error] });
+    logger.error('fatal', { error: { cause: error } });
 
     const line = lines[0] as string;
     expect(line).not.toContain('nested boom');
-    const record = JSON.parse(line) as {
-      context?: { cause?: Record<string, unknown> };
-      history?: Array<Record<string, unknown>>;
-    };
-    const redacted = { name: 'Error', code: 'E_NESTED', message: '[redacted]' };
-    expect(record.context?.cause).toStrictEqual(redacted);
-    expect(record.history?.[0]).toStrictEqual(redacted);
+    const record = JSON.parse(line) as { error?: { cause?: unknown } };
+    expect(record.error).toStrictEqual({ cause: '[redacted]' });
   });
 
   it('filters by level', () => {

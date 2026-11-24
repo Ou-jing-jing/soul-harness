@@ -3,11 +3,16 @@
  *
  * One JSON object per line. Rules (RUNTIME-LIFECYCLE §2 step 2, TRUST-BOUNDARIES
  * §11.3): no event content, no memory content, no model input/output, no tokens
- * or keys — and no way to smuggle them in through an exception stack or a nested
- * object. Values that look like content are redacted by key before serialization,
- * and `Error` objects are reduced to `{ name, code, message: '[redacted]' }`.
- * `Error.message` is untrusted free text, so it gets the same placeholder as a
- * redacted field instead of being written verbatim.
+ * or keys — and no way to smuggle them in through an exception stack, a nested
+ * object, or a field name the daemon does not use.
+ *
+ * Field names are default-deny. A key is written only when it is on the
+ * operational allowlist; every other key is kept so the drop is visible, but
+ * its value is replaced with `[redacted]` and not walked. Allowlisted keys
+ * whose names still look like content (`token`, `content`, `payload`, …) are
+ * redacted too. `Error` objects are reduced to `{ name, code, message:
+ * '[redacted]' }`. `Error.message` is untrusted free text, and a plain string
+ * field named `message` is not allowlisted, so neither path writes it.
  */
 
 import type { LogLevel } from './config.js';
@@ -31,7 +36,89 @@ export interface LoggerOptions {
 
 const LEVEL_WEIGHT: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3 };
 
-/** Keys whose values must never be written, regardless of content. */
+/**
+ * Operational fields the daemon and the runtime actually emit.
+ * Anything else is untrusted free text, whatever its key is called.
+ */
+const ALLOWED_LOG_KEYS: ReadonlySet<string> = new Set([
+  'acceptsInput',
+  'adapterEventRef',
+  'adapterId',
+  'applied',
+  'attempt',
+  'batchSize',
+  'bodyVerified',
+  'bootId',
+  'cleanupFailures',
+  'code',
+  'currentVersion',
+  'dataDir',
+  'databaseFile',
+  'drained',
+  'epoch',
+  'error',
+  'eventBus',
+  'eventId',
+  'eventIngress',
+  'eventsExpired',
+  'expectedVersion',
+  'expired',
+  'failed',
+  'from',
+  'handlers',
+  'healthEndpoint',
+  'httpApi',
+  'lockPath',
+  'lockPid',
+  'logLevel',
+  'maxAttempts',
+  'maxConcurrentTotal',
+  'maxPersonasPerRun',
+  'maxProbeQueries',
+  'maxRowsPerRun',
+  'maxScanQueries',
+  'metric',
+  'normalized',
+  'operation',
+  'owner',
+  'perPersonaChannelConcurrency',
+  'personaAdmissionCapacity',
+  'personaId',
+  'personaLifecycle',
+  'personaWaiting',
+  'personas',
+  'personasScanned',
+  'phase',
+  'pid',
+  'probed',
+  'probes',
+  'queueCapacity',
+  'reason',
+  'receivedAt',
+  'requeued',
+  'runtimeRecovery',
+  'scanned',
+  'scheduler',
+  'schema',
+  'sessionId',
+  'shutdownTimeoutMs',
+  'signal',
+  'source',
+  'sourceWaiting',
+  'state',
+  'status',
+  'step',
+  'taskDispatch',
+  'taskId',
+  'tasksFailed',
+  'tasksRequeued',
+  'to',
+  'transport',
+  'unit',
+  'version',
+]);
+
+/** Allowlisted names that still must never carry a value. */
 const REDACTED_KEY =
   /(token|secret|password|passwd|apikey|api_key|credential|content|payload|prompt|transcript|memory|body)/iu;
 
@@ -72,7 +159,11 @@ function sanitizeValue(value: unknown, depth: number): unknown {
 function sanitizeRecord(record: Record<string, unknown>, depth: number): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(record)) {
-    result[key] = REDACTED_KEY.test(key) ? REDACTED : sanitizeValue(value, depth);
+    if (!ALLOWED_LOG_KEYS.has(key) || REDACTED_KEY.test(key)) {
+      result[key] = REDACTED;
+      continue;
+    }
+    result[key] = sanitizeValue(value, depth);
   }
   return result;
 }
