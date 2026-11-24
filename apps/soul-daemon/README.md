@@ -37,6 +37,20 @@ BOOTING → MIGRATING → RECOVERING → READY → RUNNING
 | READY | 进程内 Ingress（`transport: none`，不接收外部输入）与空 Handler Map 的 Scheduler，并 `start()` | HTTP/WebSocket、健康检查传输 |
 | RUNNING | Scheduler 在跑，Handler 数仍为 0，不派发任务；进程持有数据库与锁 | 外部输入与任务执行 |
 
+RECOVERING 的边界：
+
+- Persona 归一会把旧 boot 遗留的 `RUNNING` Persona 收为 `STOPPED`，但**不会自动启动 Persona**。
+- Recovery 不是覆盖整轮的总事务。每条任务/事件写入有自己的事务；`incomplete !== null` 时本阶段 fail closed，不创建 Ingress / Scheduler，但此前已经提交的行保留。
+- 重启后，已收敛的行不会被重复处理；未完成部分在预算或数据条件满足后继续。当前测试覆盖 `maxRowsPerRun=1` 的零任务写入对照、`maxRowsPerRun=2` 的部分提交与重启，以及 `row_budget`、`persona_budget`、`probe_budget`、取消、并发修改、归档状态、unexpected event status 和非法任务行等 incomplete 原因。Daemon 不传 `maxScanQueries`，因此 `scan_query_budget_exceeded` 不是可通过 Daemon 环境变量单独复现的场景；它由 Runtime 测试覆盖。
+- `startup_aborted` 优先于 `recovery_incomplete`：Recovery 返回后、解释结果前，阶段边界会先处理停止请求。
+
+READY 的能力边界：
+
+- Ingress 对象存在并初始化，但没有 transport；`acceptsInput` 为 `false`，不能通过 HTTP、WebSocket 或网络接受真实输入。
+- Ingress 的 `close()` 会清空 buffer 和 pending TTL，并可能产生持久化 TTL 过期；它没有 drain API。`close()` 失败可能留下 TTL 状态，后续 Recovery 可能按 `buffer_lost` 收敛。
+- Scheduler 使用创建时固定的空 Handler Map，`handlerKinds = 0`，`taskDispatch = unavailable_no_handlers`。`start()` 成功只表示 Scheduler 在运行，**不表示能够派发任务**；本进程不提供 Handler 注入接口。
+- 这些能力只存在于进程内；没有 supervisor 或 health loop，也没有 HTTP/健康检查端点。
+
 关闭：
 
 ```
@@ -57,20 +71,39 @@ RUNNING → DRAINING → CLOSING → STOPPED
 - `ingress.close()` 抛错：记下 `event_bus` / `failed`，继续停 Scheduler、关库、放锁，最后仍是 `shutdown_failed`。
 - `scheduler.stop()` reject：记下 `scheduler` / `failed`，停在 `DRAINING`，不关库、不放锁，`stop()` 拒绝 `shutdown_failed`。之后的清理也不会补关库。
 - `scheduler.stop()` 一直不结束：不记失败、不关库、不放锁，`stop()` 保持 pending。本进程不取消 Handler，也没有强制退出上界。
-- `Store.close()` 抛错：记下 `sqlite_open` / `failed`，**不调用** `lock.release()`。锁文件留下，下次启动走现有陈旧锁协议。阶段进入 `STOPPED` 后 `stop()` 仍拒绝，退出码 6。
+- `Store.close()` 抛错：记下 `sqlite_open` / `failed`，**不调用** `lock.release()`。锁文件留下，下次启动走现有陈旧锁协议。阶段进入 `STOPPED` 后 `stop()` 仍拒绝，退出码 6。测试用 wrapper 在 close 之后抛错来模拟该路径，不声称覆盖 SQLite 原生底层的所有失败方式。
 - `lock.release()` 自己抛错：记下 `instance_lock` / `failed`，锁文件留下，同样是 `shutdown_failed`。
 
 启动失败：已经拿到的资源按同一规则释放。锁在数据库之前获取，锁竞争失败时**不会创建数据库文件**。启动过程中请求停止会在下一个阶段边界中止（`startup_aborted`，退出码 0），并释放锁。
 
 ## 3. 配置
 
-全部来自环境变量，缺关键项直接失败（不猜默认目录）：
+全部来自环境变量。必填项缺失或为空白直接失败；数值项必须是范围内的安全整数，**不做静默夹值**。
 
-| 变量 | 必填 | 默认 | 说明 |
+| 变量 | 必填 | 默认 | 范围与用途 |
 |---|---|---|---|
-| `SOUL_DATA_DIR` | ✅ | — | 数据目录；相对路径按进程 cwd 解析为绝对路径 |
-| `SOUL_LOG_LEVEL` | ❌ | `info` | `debug` / `info` / `warn` / `error` |
-| `SOUL_SHUTDOWN_TIMEOUT_MS` | ❌ | `10000` | 100–600000 的整数。只校验并写入 `step_ok`，**不是**关闭截止时间，也不会放弃 `scheduler.stop()` |
+| `SOUL_DATA_DIR` | ✅ | — | 非空数据目录；相对路径按进程 cwd 解析为绝对路径。没有临时目录回退 |
+| `SOUL_LOG_LEVEL` | ❌ | `info` | `debug` / `info` / `warn` / `error`；非法值使启动失败 |
+| `SOUL_SHUTDOWN_TIMEOUT_MS` | ❌ | `10000` | 整数 100–600000。只校验并记录，**不是**关闭截止时间，也不会中止 `scheduler.stop()` |
+| `SOUL_TASK_MAX_ATTEMPTS` | ✅ | — | 整数 1–100；Recovery 与 Scheduler 共用的冻结 `policy.maxAttempts` |
+| `SOUL_TASK_RETRY_BACKOFF_MS` | ✅ | — | 整数 0–86400000；共用 `policy.retryBackoffMs`，Scheduler 用固定退避 |
+| `SOUL_RECOVERY_BATCH_SIZE` | ❌ | `200` | 整数 1–500；Recovery 分页查询的批量大小 |
+| `SOUL_RECOVERY_MAX_ROWS` | ❌ | `10000` | 整数 1–1000000；单轮 Recovery 行预算，**包含 Persona 枚举行** |
+| `SOUL_RECOVERY_MAX_PERSONAS` | ❌ | `200` | 整数 1–10000；单轮 Recovery 最多扫描的 Persona 数 |
+| `SOUL_SCHEDULER_MAX_TOTAL` | ❌ | `8` | 整数 1–1024；Scheduler 全局并发 Handler 上限 |
+| `SOUL_SCHEDULER_PER_UNIT` | ❌ | `1` | 整数 1–64；每个 Persona × channel 的并发槽 |
+| `SOUL_INGRESS_QUEUE_CAPACITY` | ❌ | `256` | 整数 1–1000000；进程内 Ingress 队列容量 |
+| `SOUL_INGRESS_BUFFER_TTL_MS` | ❌ | `300000` | 整数 1–86400000；进程内 buffer 的 TTL |
+| `SOUL_INGRESS_PERSONA_CAPACITY` | ❌ | `8` | 整数 1–1024；每个 Persona 的 in-flight admission 上限 |
+
+校验分类：
+
+- 必填项缺失、空字符串或纯空白 → `config_missing`；
+- 格式错误、非安全整数或越界 → `config_invalid`；
+- 可选项缺失或空白 → 使用上表默认值；
+- `SOUL_SHUTDOWN_TIMEOUT_MS` 保留旧的 `Number()` 解析，接受 `2500.0`、`2.5e3`、`+2500` 等整数值形式；其余 10 个数值项只接受十进制数字字符串。
+
+Ingress 的三个参数会传给进程内 Ingress；由于没有 transport，配置本身**不代表**外部输入已经接入。Scheduler 的两个并发参数会传入 Scheduler，但当前 Handler Map 固定为空，仍不会派发任务。
 
 ## 4. 数据目录与单实例锁
 
@@ -120,7 +153,10 @@ RUNNING → DRAINING → CLOSING → STOPPED
 
 ```bash
 pnpm --filter @soul-harness/soul-daemon build
-SOUL_DATA_DIR=/var/lib/soul node apps/soul-daemon/dist/main.js     # 前台运行
+SOUL_DATA_DIR=/var/lib/soul \
+SOUL_TASK_MAX_ATTEMPTS=3 \
+SOUL_TASK_RETRY_BACKOFF_MS=1000 \
+node apps/soul-daemon/dist/main.js     # 前台运行
 ```
 
 - 正常启动：日志出现 `phase_entered: RUNNING`，进程常驻（内部持有 ref'd timer，避免空事件循环退出）。Scheduler 已启动，Handler 数是 0。
@@ -140,7 +176,7 @@ SOUL_DATA_DIR=/var/lib/soul node apps/soul-daemon/dist/main.js     # 前台运�
 
 ## 6. 当前真实支持的能力
 
-- ✅ 环境配置校验、结构化 JSON 日志（未登记的键、自由字符串和普通错误对象会打码）
+- ✅ 环境配置校验、结构化 JSON 日志（未登记字段名直接丢弃；自由字符串和普通错误对象会打码）
 - ✅ 数据目录创建 + 真实写入探测
 - ✅ 按目录的单实例锁（原子、探活、陈旧接管、持有者校验）
 - ✅ Store 打开、Migration、Schema 校验
@@ -157,6 +193,7 @@ SOUL_DATA_DIR=/var/lib/soul node apps/soul-daemon/dist/main.js     # 前台运�
 | 任务派发 | Handler Map 固定为空。Scheduler `running` 不等于会执行任务 |
 | 在途 Handler 的取消或有界等待 | `scheduler.stop()` 未结束就一直等。没有超时强制关库 |
 | HTTP / WebSocket、健康检查传输 | 未实现。进程内 `status` 不是健康端点 |
+| Supervisor / health loop | 未实现。没有外部监督进程或自动重启循环 |
 | Runtime checkpoint | 不写。只记录 `checkpoint_skipped` |
 | 显式 `PRAGMA wal_checkpoint` | 未实现。关闭只调用 `Store.close()` |
 | drain | 未实现。不要把 `DRAINING` 读成“缓冲已排空” |
@@ -171,16 +208,18 @@ pnpm test
 
 | 文件 | 覆盖 |
 |---|---|
-| `test/config.test.ts` | 缺配置、空值、相对路径解析、非法日志级别/超时、默认值 |
-| `test/logger.test.ts` | JSON 行、敏感键与未登记值打码、错误不带堆栈、级别过滤 |
+| `test/config.test.ts` | 缺配置、必填项空值、13 个变量的范围/格式、相对路径解析、默认值 |
+| `test/logger.test.ts` | JSON 行、未知字段名丢弃、敏感值打码、错误不带堆栈、级别过滤 |
+| `test/components.test.ts` | 组件适配：同一 policy 对象、clock/logger 适配、不复制 policy 字段 |
+| `test/phases.test.ts` | 生命周期步骤与 capability surface 不夸大实现状态 |
 | `test/lock.test.ts` | 原子创建、同目录拒绝、不同目录独立、幂等/持有者校验、损坏锁拒绝、活锁拒绝、死锁接管、抢占唯一性 |
 | `test/lock-race.test.ts` | 陈旧锁接管竞态（真实进程）：多个竞争者恰好一个胜出；胜者持锁时后来者被拒绝 |
 | `test/child-watch.test.ts` | 子进程观察器：spawn 失败不挂起；runtime error 不算 close；超时是清理失败；批量清理等待每一个子进程 |
 | `test/daemon.test.ts` | 启动到 RUNNING、阶段顺序、锁竞争不建库、Migration 失败清理、启动中停止、关闭顺序、锁释放失败仍报 `shutdown_failed`、重启 |
-| `test/recovery.test.ts` | 空库、崩溃收敛、恢复失败与 incomplete 不装配 Scheduler |
+| `test/recovery.test.ts` | 空库、崩溃收敛、部分提交与重启幂等、budget/probe/取消/并发/归档/非法行等 incomplete、恢复失败不装配 Scheduler |
 | `test/ready.test.ts` | Ingress / 空 Handler Scheduler 的装配、日志顺序、边界上的启动中止 |
 | `test/ready-failure.test.ts` | 装配失败、`stop()` 未结束前不关库、`Store.close()` 失败留锁且退出码 6、Ingress 关闭失败、`scheduler.stop()` 拒绝 |
-| `test/process.test.ts` | 真实进程：退出码 2/3/4/5、`RUNNING` 时信号优雅停止、`MIGRATING` 时 SIGTERM 中止且放锁、双实例拒绝、崩溃后残留锁接管、恢复失败不派发 |
+| `test/process.test.ts` | 真实进程：退出码 2/3/4/5、`RUNNING` 时信号优雅停止、`MIGRATING` 时 SIGTERM 中止且放锁、双实例拒绝、SIGKILL 后数据库与任务行、陈旧锁接管、部分 Recovery 后锁释放、恢复失败不派发 |
 
 进程测试在 `beforeAll` 中构建 `dist/`（Node 的类型剥离不能把 `.js` specifier 解析成 `.ts`），
 随后以真实子进程运行构建产物——与部署路径一致。
