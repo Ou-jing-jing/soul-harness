@@ -20,21 +20,23 @@ function capture(level: 'debug' | 'info' | 'warn' | 'error' = 'debug'): {
 describe('structured logging', () => {
   it('emits one JSON object per line with the bound context', () => {
     const { lines, logger } = capture();
-    logger.child({ personaId: 'psn_x' }).info('phase_entered', { phase: 'RUNNING' });
+    logger.child({ personaId: 'psn_01JQ8Z3K5M7P9R2T4V6X8Z0ABC' }).info('phase_entered', {
+      phase: 'RUNNING',
+    });
 
     expect(lines).toHaveLength(1);
     expect(JSON.parse(lines[0] as string)).toMatchObject({
       ts: '2026-01-01T00:00:00.000Z',
       level: 'info',
       event: 'phase_entered',
-      personaId: 'psn_x',
+      personaId: 'psn_01JQ8Z3K5M7P9R2T4V6X8Z0ABC',
       phase: 'RUNNING',
     });
   });
 
   it('redacts content-bearing keys at any depth', () => {
     const { lines, logger } = capture();
-    logger.info('test', {
+    logger.info('boot_failed', {
       token: 'secret-token',
       content: 'the persona said hello',
       payload: { nested: 'memory body' },
@@ -61,7 +63,7 @@ describe('structured logging', () => {
     const modelOutput = 'model replied with amber-otter too';
     const privateConversation = 'private conversation amber-otter';
 
-    logger.info('diagnostic', {
+    logger.info('boot_failed', {
       message: userInput,
       detail: modelOutput,
       context: privateConversation,
@@ -78,7 +80,7 @@ describe('structured logging', () => {
 
   it('does not walk an unknown object far enough to leak a nested value', () => {
     const { lines, logger } = capture();
-    logger.info('diagnostic', {
+    logger.info('boot_failed', {
       context: { cause: { message: 'nested amber-otter', token: 'sk-live' } },
       history: ['amber-otter'],
     });
@@ -136,7 +138,7 @@ describe('structured logging', () => {
     expect(line).not.toContain('at ');
   });
 
-  it('redacts an unknown nested key even when it holds an error', () => {
+  it('does not walk an error value that is not an Error instance', () => {
     const { lines, logger } = capture();
     const error = Object.assign(new Error('nested boom'), { code: 'E_NESTED' });
 
@@ -144,8 +146,8 @@ describe('structured logging', () => {
 
     const line = lines[0] as string;
     expect(line).not.toContain('nested boom');
-    const record = JSON.parse(line) as { error?: { cause?: unknown } };
-    expect(record.error).toStrictEqual({ cause: '[redacted]' });
+    const record = JSON.parse(line) as { error?: unknown };
+    expect(record.error).toBe('[redacted]');
   });
 
   it('does not log an external source, a raw adapter ref, or a free-text reason or event', () => {
@@ -189,14 +191,69 @@ describe('structured logging', () => {
 
   it('filters by level', () => {
     const { lines, logger } = capture('warn');
-    logger.debug('d');
-    logger.info('i');
-    logger.warn('w');
-    logger.error('e');
+    logger.debug('boot_started');
+    logger.info('phase_entered');
+    logger.warn('drain_started');
+    logger.error('boot_failed');
 
     expect(lines.map((line) => (JSON.parse(line) as { event: string }).event)).toStrictEqual([
-      'w',
-      'e',
+      'drain_started',
+      'boot_failed',
     ]);
+  });
+
+  it('drops an event name that is not one this process emits', () => {
+    const { lines, logger } = capture();
+    logger.info('daemon_stopped');
+    logger.info('daemon_stopped_forged');
+
+    const events = lines.map((line) => (JSON.parse(line) as { event: string }).event);
+    expect(events).toStrictEqual(['daemon_stopped', 'invalid_event']);
+    expect(lines.join('\n')).not.toContain('daemon_stopped_forged');
+  });
+
+  it('does not walk a plain object supplied as error', () => {
+    const { lines, logger } = capture();
+    logger.error('fatal', { error: { code: 'amber-otter', name: 'DaemonError' } });
+
+    const record = JSON.parse(lines[0] as string) as { error?: unknown };
+    expect(record.error).toBe('[redacted]');
+    expect(lines[0]).not.toContain('amber-otter');
+    expect(lines[0]).not.toContain('DaemonError');
+  });
+
+  it('redacts a string that does not match the rule for its key', () => {
+    const { lines, logger } = capture();
+    logger.info('phase_entered', {
+      phase: 'not a phase amber-otter',
+      code: 'lock_held',
+      step: 'logging',
+      personaId: 'psn_x',
+    });
+
+    const record = JSON.parse(lines[0] as string) as Record<string, unknown>;
+    expect(record['phase']).toBe('[redacted]');
+    expect(record['code']).toBe('lock_held');
+    expect(record['step']).toBe('logging');
+    expect(record['personaId']).toBe('[redacted]');
+    expect(lines[0]).not.toContain('amber-otter');
+  });
+
+  it('redacts an error name or code outside the closed sets', () => {
+    const { lines, logger } = capture();
+    const error = Object.assign(new Error('amber-otter'), {
+      name: 'amber-otter happened',
+      code: 'amber-otter',
+    });
+
+    logger.error('fatal', { error });
+
+    const record = JSON.parse(lines[0] as string) as { error?: Record<string, unknown> };
+    expect(record.error).toStrictEqual({
+      name: '[redacted]',
+      code: '[redacted]',
+      message: '[redacted]',
+    });
+    expect(lines[0]).not.toContain('amber-otter');
   });
 });
