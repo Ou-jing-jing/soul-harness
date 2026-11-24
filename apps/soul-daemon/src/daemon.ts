@@ -8,14 +8,18 @@
  *
  * What is real: configuration, structured logging, data-directory probe, the
  * single-instance lock, opening SQLite, running migrations, verifying the
- * schema, normalizing crashed personas, and `recoverRuntime`. What is **not**
- * real yet: the event bus, the scheduler, HTTP/WebSocket and the health
- * transport. Recovery must finish completely before the process is allowed to
- * continue, and this phase does not create those later components.
+ * schema, normalizing crashed personas, `recoverRuntime`, an in-process
+ * ingress with no transport, and a scheduler with an empty handler map. What
+ * is **not** real yet: external input, task dispatch, HTTP/WebSocket and the
+ * health transport. Recovery must finish completely before those later
+ * components are created.
  *
- * Resource discipline: acquisition order is recorded, failures unwind it in
- * reverse, and cleanup failures are collected and reported instead of being
- * swallowed — a broken cleanup must never look like a clean shutdown.
+ * Resource discipline: ingress is closed first, then `scheduler.stop()` is
+ * awaited, and only then is the store closed and the instance lock released.
+ * `SOUL_SHUTDOWN_TIMEOUT_MS` is not a deadline. Cleanup failures are collected
+ * and reported instead of being swallowed. A broken cleanup must never look
+ * like a clean shutdown. What happens after `Store.close()` itself throws is
+ * unchanged and is not a new lock policy.
  */
 
 import { join } from 'node:path';
@@ -25,6 +29,9 @@ import { migrate, openStore, verifySchema, type Store } from '@soul-harness/pers
 import type { DaemonConfig } from './config.js';
 import {
   adaptRecoveryLogger,
+  adaptRuntimeLogger,
+  createDaemonIngress,
+  createDaemonScheduler,
   runPersonaRecovery,
   runRuntimeRecovery,
   toRuntimeNow,
@@ -36,6 +43,7 @@ import { acquireInstanceLock, type InstanceLock } from './lock.js';
 import type { Logger } from './logger.js';
 import {
   CURRENT_RUNTIME_SURFACE,
+  READY_TARGET_SURFACE,
   RECOVERED_RUNTIME_SURFACE,
   STARTUP_STEPS,
   type DaemonComponentSurface,
@@ -136,6 +144,8 @@ export class SoulDaemon {
   #lock: InstanceLock | null = null;
   #store: Store | null = null;
   #lifecycle: PersonaRecoveryOutcome['lifecycle'] | null = null;
+  #ingress: ReturnType<typeof createDaemonIngress> | null = null;
+  #scheduler: ReturnType<typeof createDaemonScheduler> | null = null;
   #surface: DaemonRuntimeSurface = CURRENT_RUNTIME_SURFACE;
   #recovery: DaemonRecoverySummary | null = null;
   #recoveryAbort: AbortController | null = null;
@@ -276,12 +286,15 @@ export class SoulDaemon {
       const recovery = await this.#recover(store, lock.holder.bootToken);
       await this.#boundary();
 
-      // 10–13. Transports and the scheduler are still not implemented.
+      // Ingress, then the scheduler. Neither exists unless recovery finished.
+      // A stop at a boundary does not continue, and a failed create does not
+      // leave the next component running.
       this.#enter('READY');
+      await this.#assembleReady(store);
       this.#skipUnimplemented('READY', skipped);
       await this.#boundary();
 
-      // 14. Running. Recovery finished; the scheduler still does not exist.
+      // Running. The scheduler is running and still has no handlers.
       this.#enter('RUNNING');
       this.#startedAt = this.#clock().toISOString();
       const surface = this.#surface;
@@ -292,8 +305,11 @@ export class SoulDaemon {
         personaLifecycle: surface.capabilities.personaLifecycle,
         runtimeRecovery: surface.capabilities.runtimeRecovery,
         eventBus: surface.capabilities.eventBus,
+        eventIngress: surface.capabilities.eventIngress,
         scheduler: surface.capabilities.scheduler,
         taskDispatch: surface.capabilities.taskDispatch,
+        httpApi: surface.capabilities.httpApi,
+        healthEndpoint: surface.capabilities.healthEndpoint,
       });
 
       return {
@@ -310,7 +326,7 @@ export class SoulDaemon {
         capabilities: surface.capabilities,
       };
     } catch (error) {
-      const cleanup = this.#releaseAll();
+      const cleanup = await this.#releaseAll();
       this.#phase = 'FAILED';
 
       const code = isDaemonError(error) ? error.code : 'startup_failed';
@@ -346,11 +362,16 @@ export class SoulDaemon {
     if (ranForReal) {
       this.#enter('DRAINING');
       this.#logger.info('drain_started', { reason });
-      this.#logger.info('step_skipped', {
-        step: 'scheduler_drain',
-        owner: 'SH-008',
-        reason: 'not_implemented',
-      });
+      // A scheduler that was actually started is stopped below. Saying the
+      // drain is unimplemented after that would be a lie. The skip remains
+      // only for a READY boundary that aborted before the scheduler existed.
+      if (this.#scheduler === null) {
+        this.#logger.info('step_skipped', {
+          step: 'scheduler_drain',
+          owner: 'SH-008',
+          reason: 'not_implemented',
+        });
+      }
     }
 
     // Checkpointing is only legal when a runtime exists to produce one. Writing a
@@ -358,7 +379,7 @@ export class SoulDaemon {
     this.#logger.info('checkpoint_skipped', { reason: 'runtime_not_implemented' });
 
     this.#enter('CLOSING');
-    steps.push(...this.#releaseAll());
+    steps.push(...(await this.#releaseAll()));
 
     this.#enter('STOPPED');
     const report: StopReport = { phase: 'STOPPED', reason, steps };
@@ -379,8 +400,38 @@ export class SoulDaemon {
     return report;
   }
 
-  #releaseAll(): StepOutcome[] {
+  async #releaseAll(): Promise<StepOutcome[]> {
     const outcomes: StepOutcome[] = [];
+
+    // Ingress first, then the scheduler, then the store and the lock.
+    // `scheduler.stop()` must settle before `Store.close()`. Nothing here
+    // reads `shutdownTimeoutMs`, and a close failure still falls through to
+    // the lock the same way it did before this phase.
+    const ingress = this.#ingress;
+    this.#ingress = null;
+    if (ingress !== null) {
+      try {
+        ingress.close();
+        outcomes.push({ step: 'event_bus', status: 'ok' });
+      } catch (error) {
+        const code = isDaemonError(error) ? error.code : 'shutdown_failed';
+        outcomes.push({ step: 'event_bus', status: 'failed', code });
+        this.#logger.error('cleanup_failed', { step: 'event_bus', code });
+      }
+    }
+
+    const scheduler = this.#scheduler;
+    this.#scheduler = null;
+    if (scheduler !== null) {
+      try {
+        await scheduler.stop();
+        outcomes.push({ step: 'scheduler', status: 'ok' });
+      } catch (error) {
+        const code = isDaemonError(error) ? error.code : 'shutdown_failed';
+        outcomes.push({ step: 'scheduler', status: 'failed', code });
+        this.#logger.error('cleanup_failed', { step: 'scheduler', code });
+      }
+    }
 
     for (const resource of [...this.#resources].reverse()) {
       if (resource.released) {
@@ -409,6 +460,73 @@ export class SoulDaemon {
     }
 
     return outcomes;
+  }
+
+  /**
+   * Ingress, then scheduler. The surface is published only after `start()`.
+   * Boundaries sit before each component so a stop does not continue.
+   */
+  async #assembleReady(store: Store): Promise<void> {
+    const now = toRuntimeNow(this.#clock);
+    const logger = adaptRuntimeLogger(this.#logger);
+
+    await this.#boundary();
+
+    try {
+      this.#ingress = createDaemonIngress({
+        store,
+        logger,
+        now,
+        ingress: this.#config.ingress,
+      });
+    } catch (error) {
+      this.#throwAssemblyFailure(error, 'event_bus_start_failed', 'event bus failed to start');
+    }
+    this.#logger.info('step_ok', { step: 'event_bus', transport: 'none', acceptsInput: false });
+    await this.#boundary();
+
+    let scheduler: ReturnType<typeof createDaemonScheduler>;
+    try {
+      scheduler = createDaemonScheduler({
+        store,
+        logger,
+        policy: this.#config.policy,
+        now,
+        scheduler: this.#config.scheduler,
+      });
+    } catch (error) {
+      this.#throwAssemblyFailure(error, 'scheduler_start_failed', 'scheduler failed to start');
+    }
+    this.#scheduler = scheduler;
+    await this.#boundary();
+
+    try {
+      scheduler.start();
+    } catch (error) {
+      this.#throwAssemblyFailure(error, 'scheduler_start_failed', 'scheduler failed to start');
+    }
+    this.#surface = READY_TARGET_SURFACE;
+    this.#logger.info('step_ok', {
+      step: 'scheduler',
+      state: 'running',
+      handlerKinds: 0,
+      dispatchesTasks: false,
+    });
+  }
+
+  #throwAssemblyFailure(
+    error: unknown,
+    code: 'event_bus_start_failed' | 'scheduler_start_failed',
+    message: string,
+  ): never {
+    if (this.#stopRequested) {
+      throw new DaemonError('startup_aborted', 'stop requested while the daemon was booting');
+    }
+    if (isDaemonError(error)) {
+      throw error;
+    }
+    this.#logger.error(code, { code });
+    throw new DaemonError(code, message, { cause: error });
   }
 
   #skipUnimplemented(phase: 'READY', skipped: string[]): void {

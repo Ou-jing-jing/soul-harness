@@ -249,7 +249,7 @@ describe('real process lifecycle', { timeout: TEST_TIMEOUT }, () => {
   );
 
   it(
-    'finishes recovery on a normal start and does not start a scheduler',
+    'finishes recovery, starts the empty scheduler, and still does not dispatch',
     async () => {
       const dir = tempDir();
       const spawned = spawnDaemon({ env: { SOUL_DATA_DIR: dir }, entry: SIGNAL_RUNNER });
@@ -264,8 +264,21 @@ describe('real process lifecycle', { timeout: TEST_TIMEOUT }, () => {
           (record) => record['event'] === 'step_ok' && record['step'] === 'runtime_recovery',
         ),
       ).toBe(true);
-      expect(spawned.records.some((record) => record['event'] === 'scheduler_started')).toBe(false);
-      expect(spawned.records.some((record) => record['event'] === 'scheduler_created')).toBe(false);
+      expect(
+        spawned.records.some(
+          (record) => record['event'] === 'scheduler_started' && record['handlers'] === 0,
+        ),
+      ).toBe(true);
+      expect(spawned.records.some((record) => record['event'] === 'scheduler_created')).toBe(true);
+      expect(
+        spawned.records.some(
+          (record) =>
+            record['event'] === 'daemon_running' &&
+            record['taskDispatch'] === 'unavailable_no_handlers' &&
+            record['eventIngress'] === 'unavailable_no_transport',
+        ),
+      ).toBe(true);
+      expect(spawned.records.some((record) => record['event'] === 'scheduler_stopped')).toBe(true);
     },
     TEST_TIMEOUT,
   );

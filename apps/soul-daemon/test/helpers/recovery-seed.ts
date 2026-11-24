@@ -73,6 +73,16 @@ export function seedPersona(
   });
 }
 
+/** Inserts one queued task and leaves it unclaimed. */
+export function seedQueuedTask(store: Store, n: number, persona = 1): void {
+  repos(store).tasks.insertQueuedTask({
+    id: tid(n),
+    personaId: pid(persona),
+    kind: 'thought.run',
+    channel: 'inner',
+  });
+}
+
 /** Inserts one queued task and claims it, so the row is a legal `running` task. */
 export function seedRunningTask(store: Store, n: number, persona = 1): void {
   repos(store).tasks.insertQueuedTask({

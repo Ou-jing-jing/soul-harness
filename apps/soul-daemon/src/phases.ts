@@ -2,14 +2,15 @@
  * Lifecycle vocabulary.
  *
  * The phase names and their order come from RUNTIME-LIFECYCLE §2/§3 and are not
- * negotiable. The *steps* are listed explicitly with an honest status: this batch
- * implements the infrastructure half of the startup table, and everything that
- * depends on the Runtime, the event bus, the scheduler or the HTTP surface is
- * marked `not_implemented` with the stage that owns it.
+ * negotiable. Steps say what this process actually does. Recovery, the
+ * in-process ingress, and the empty-handler scheduler are implemented. HTTP
+ * and health stay `not_implemented`. Static `CAPABILITIES` is not rewritten
+ * when a step starts running.
  *
  * That is the difference between "the database is open" and "the runtime has
- * recovered". E2 performs persona normalize and `recoverRuntime`. It does not
- * create an ingress or a scheduler, and it must not report those as running.
+ * recovered". Persona normalize and `recoverRuntime` run in RECOVERING. READY
+ * creates an in-process ingress with no transport and a scheduler with an
+ * empty handler map. HTTP and health stay unimplemented.
  */
 
 export const BOOT_PHASES = ['BOOTING', 'MIGRATING', 'RECOVERING', 'READY', 'RUNNING'] as const;
@@ -93,16 +94,14 @@ export const STARTUP_STEPS: readonly LifecycleStep[] = [
   {
     id: 'event_bus',
     phase: 'READY',
-    status: 'not_implemented',
-    owner: 'SH-008',
-    note: 'no transport receives events yet',
+    status: 'implemented',
+    note: 'in-process ingress only; no transport and no external input',
   },
   {
     id: 'scheduler',
     phase: 'READY',
-    status: 'not_implemented',
-    owner: 'SH-008',
-    note: 'no work is dispatched',
+    status: 'implemented',
+    note: 'running with an empty handler map; tasks are not dispatched',
   },
   {
     id: 'http_api',
@@ -294,9 +293,11 @@ export const RECOVERED_RUNTIME_SURFACE: DaemonRuntimeSurface = freezeSurface(
 );
 
 /**
- * The shape E3 is allowed to report once those objects actually exist.
- * Not wired into `SoulDaemon` in E1. `scheduler: 'running'` stays paired with
+ * What a successful READY boot reports once the ingress and the scheduler
+ * actually exist. `scheduler: 'running'` stays paired with
  * `taskDispatch: 'unavailable_no_handlers'` and `dispatchesTasks: false`.
+ * Assigned only after both objects are up; not a static claim that every
+ * capability in `CAPABILITIES` is implemented.
  */
 export const READY_TARGET_SURFACE: DaemonRuntimeSurface = freezeSurface(
   {

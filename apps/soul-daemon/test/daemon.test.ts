@@ -65,7 +65,9 @@ describe('startup', () => {
 
     expect(report.skippedSteps).not.toContain('persona_recovery');
     expect(report.skippedSteps).not.toContain('runtime_recovery');
-    expect(report.skippedSteps).toEqual(['event_bus', 'scheduler', 'http_api', 'health_check']);
+    expect(report.skippedSteps).not.toContain('event_bus');
+    expect(report.skippedSteps).not.toContain('scheduler');
+    expect(report.skippedSteps).toEqual(['http_api', 'health_check']);
     expect(report.recovery).toEqual({
       personasNormalized: 0,
       personasScanned: 0,
@@ -74,17 +76,26 @@ describe('startup', () => {
       eventsExpired: 0,
     });
     expect(report.components.personaLifecycle).toEqual({ assembled: true, autoStarted: false });
-    expect(report.components.eventBus.assembled).toBe(false);
+    expect(report.components.eventBus).toEqual({
+      assembled: true,
+      initialized: true,
+      transport: 'none',
+      acceptsInput: false,
+    });
     expect(report.components.scheduler).toEqual({
-      assembled: false,
-      started: false,
-      state: 'absent',
+      assembled: true,
+      started: true,
+      state: 'running',
       handlerKinds: 0,
       dispatchesTasks: false,
     });
-    expect(report.capabilities.scheduler).toBe('not_implemented');
+    expect(report.capabilities.scheduler).toBe('running');
+    expect(report.capabilities.taskDispatch).toBe('unavailable_no_handlers');
+    expect(report.capabilities.eventBus).toBe('assembled_no_transport');
+    expect(report.capabilities.eventIngress).toBe('unavailable_no_transport');
     expect(report.capabilities.runtimeRecovery).toBe('assembled');
     expect(report.capabilities.httpApi).toBe('not_implemented');
+    expect(report.capabilities.healthEndpoint).toBe('not_implemented');
     expect(daemon.status.components).toBe(report.components);
     expect(daemon.status.capabilities).toBe(report.capabilities);
     expect(daemon.status.personaLifecycleAssembled).toBe(true);
@@ -92,9 +103,14 @@ describe('startup', () => {
     expect(lock['bootToken']).toBe(report.bootId);
 
     const running = events(records, 'daemon_running')[0];
-    expect(running?.['scheduler']).toBe('not_implemented');
-    expect(running?.['taskDispatch']).toBe('not_implemented');
-    expect(records.some((record) => record['event'] === 'scheduler_started')).toBe(false);
+    expect(running?.['scheduler']).toBe('running');
+    expect(running?.['taskDispatch']).toBe('unavailable_no_handlers');
+    expect(running?.['eventIngress']).toBe('unavailable_no_transport');
+    expect(running?.['httpApi']).toBe('not_implemented');
+    expect(records.some((record) => record['event'] === 'scheduler_started')).toBe(true);
+    expect(
+      records.some((record) => record['event'] === 'scheduler_started' && record['handlers'] === 0),
+    ).toBe(true);
 
     await daemon.stop('test-finished');
   });
@@ -198,7 +214,12 @@ describe('shutdown', () => {
     const report = await daemon.stop('test');
 
     expect(report.phase).toBe('STOPPED');
-    expect(report.steps.map((step) => step.step)).toStrictEqual(['sqlite_open', 'instance_lock']);
+    expect(report.steps.map((step) => step.step)).toStrictEqual([
+      'event_bus',
+      'scheduler',
+      'sqlite_open',
+      'instance_lock',
+    ]);
     expect(report.steps.every((step) => step.status === 'ok')).toBe(true);
 
     expect(existsSync(join(dir, LOCK_FILE_NAME))).toBe(false);

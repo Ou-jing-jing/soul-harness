@@ -1,24 +1,31 @@
 /**
- * RECOVERING assembly.
+ * Runtime assembly.
  *
- * Creates the persona lifecycle, normalizes crashed personas, and runs
- * `recoverRuntime`. Adapts the daemon logger and the millisecond clock, and
- * reuses the daemon's store, boot id, and frozen policy.
+ * RECOVERING creates the persona lifecycle, normalizes crashed personas, and
+ * runs `recoverRuntime`. READY creates the in-process ingress and the
+ * scheduler. Both phases reuse the daemon's store, clock, logger, and frozen
+ * policy.
  *
- * No ingress, no scheduler, no handler map, no SQL, and no test-only budget
- * parameters. `maxScanQueries` and `maxProbeQueries` are intentionally absent:
- * recovery keeps the runtime defaults.
+ * No transport, no handler map retained by the daemon, no SQL, and no
+ * test-only budget parameters. `maxScanQueries` and `maxProbeQueries` are
+ * intentionally absent: recovery keeps the runtime defaults. The scheduler
+ * handler map is an empty map created here and not stored.
  */
 
 import type { Store } from '@soul-harness/persistence';
 import {
   createPersonaLifecycle,
+  createScheduler,
+  createStimulusIngress,
   recoverRuntime,
   type PersonaLifecycle,
   type PersonaLifecycleOptions,
   type RecoveryReport,
   type RuntimeLogFields,
   type RuntimeLogger,
+  type StimulusIngress,
+  type TaskHandler,
+  type TaskScheduler,
 } from '@soul-harness/runtime';
 
 import type { DaemonConfig } from './config.js';
@@ -111,5 +118,42 @@ export function runRuntimeRecovery(input: {
     maxRowsPerRun: input.recovery.maxRowsPerRun,
     maxPersonasPerRun: input.recovery.maxPersonasPerRun,
     signal: input.signal,
+  });
+}
+
+/** In-process ingress. No transport, no adapter registry, no external entry. */
+export function createDaemonIngress(input: {
+  readonly store: Store;
+  readonly logger: RuntimeLogger;
+  readonly now: () => number;
+  readonly ingress: DaemonConfig['ingress'];
+}): StimulusIngress {
+  return createStimulusIngress({
+    store: input.store,
+    logger: input.logger,
+    now: input.now,
+    config: input.ingress,
+  });
+}
+
+/**
+ * Scheduler over the same store and the same frozen policy Recovery used.
+ * The handler map is empty and is not retained. Running does not dispatch.
+ */
+export function createDaemonScheduler(input: {
+  readonly store: Store;
+  readonly logger: RuntimeLogger;
+  /** The same object passed to `recoverRuntime`. Not a copy. */
+  readonly policy: DaemonConfig['policy'];
+  readonly now: () => number;
+  readonly scheduler: DaemonConfig['scheduler'];
+}): TaskScheduler {
+  return createScheduler({
+    store: input.store,
+    logger: input.logger,
+    policy: input.policy,
+    handlers: new Map<string, TaskHandler>(),
+    now: input.now,
+    config: input.scheduler,
   });
 }
