@@ -148,6 +148,45 @@ describe('structured logging', () => {
     expect(record.error).toStrictEqual({ cause: '[redacted]' });
   });
 
+  it('does not log an external source, a raw adapter ref, or a free-text reason or event', () => {
+    const { lines, logger } = capture();
+    const source = 'minecraft.chat';
+    const adapterId = 'minecraft';
+    const ref = 'player:chat:1';
+    const freeReason = 'the user typed a secret phrase amber-otter';
+    const freeEvent = 'amber-otter happened';
+
+    logger.info(freeEvent, {
+      source,
+      adapterId,
+      adapterEventRef: ref,
+      reason: freeReason,
+      phase: 'RUNNING',
+    });
+    logger.info('phase_entered', { reason: 'probe_budget_exceeded' });
+
+    const first = JSON.parse(lines[0] as string) as Record<string, unknown>;
+    const second = JSON.parse(lines[1] as string) as Record<string, unknown>;
+    expect(first['event']).toBe('invalid_event');
+    expect(first['source']).toBe('[redacted]');
+    expect(first['adapterId']).toBe('[redacted]');
+    expect(first['reason']).toBe('[redacted]');
+    expect(first['phase']).toBe('RUNNING');
+    expect(first['adapterEventRef']).toMatch(/^ref_[0-9a-f]{16}$/u);
+    expect(second).toMatchObject({ event: 'phase_entered', reason: 'probe_budget_exceeded' });
+    const text = lines.join('\n');
+    expect(text).not.toContain(source);
+    expect(text).not.toContain(adapterId);
+    expect(text).not.toContain(ref);
+    expect(text).not.toContain('amber-otter');
+
+    const again = capture();
+    again.logger.info('ingress.accepted', { adapterEventRef: ref });
+    expect(JSON.parse(again.lines[0] as string)).toMatchObject({
+      adapterEventRef: first['adapterEventRef'],
+    });
+  });
+
   it('filters by level', () => {
     const { lines, logger } = capture('warn');
     logger.debug('d');

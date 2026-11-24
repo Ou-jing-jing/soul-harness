@@ -10,10 +10,21 @@
  * operational allowlist; every other key is kept so the drop is visible, but
  * its value is replaced with `[redacted]` and not walked. Allowlisted keys
  * whose names still look like content (`token`, `content`, `payload`, …) are
- * redacted too. `Error` objects are reduced to `{ name, code, message:
- * '[redacted]' }`. `Error.message` is untrusted free text, and a plain string
- * field named `message` is not allowlisted, so neither path writes it.
+ * redacted too.
+ *
+ * A matching name is not enough for a value that can come from outside the
+ * process. `source` and `adapterId` stay redacted until the adapter registry
+ * exists — a shape check is not that registry. `adapterEventRef` is written
+ * only as a short hash. `reason` must be one of the fixed operational codes.
+ * `event` must match the internal event-name shape; anything else is replaced
+ * with `invalid_event` and the original text is dropped.
+ *
+ * `Error` objects are reduced to `{ name, code, message: '[redacted]' }`.
+ * `Error.message` is untrusted free text, and a plain string field named
+ * `message` is not allowlisted, so neither path writes it.
  */
+
+import { createHash } from 'node:crypto';
 
 import type { LogLevel } from './config.js';
 
@@ -81,6 +92,7 @@ const ALLOWED_LOG_KEYS: ReadonlySet<string> = new Set([
   'normalized',
   'operation',
   'owner',
+  'pending',
   'perPersonaChannelConcurrency',
   'personaAdmissionCapacity',
   'personaId',
@@ -122,9 +134,84 @@ const ALLOWED_LOG_KEYS: ReadonlySet<string> = new Set([
 const REDACTED_KEY =
   /(token|secret|password|passwd|apikey|api_key|credential|content|payload|prompt|transcript|memory|body)/iu;
 
+/** Internal event names. A caller-supplied string that misses this is dropped. */
+const EVENT_NAME = /^[a-z][a-z0-9._-]{0,80}$/u;
+
+/**
+ * Adapter-side stimulus reference. Same shape as the contracts pattern: opaque,
+ * and too narrow to carry prose. The raw value is still not logged.
+ */
+const ADAPTER_EVENT_REF = /^[A-Za-z0-9._:-]{1,64}$/u;
+
+/**
+ * Reasons the daemon and the runtime emit. A free-text stop reason or an
+ * external string is not in this set. Step notes are the fixed strings from
+ * the lifecycle table, not caller input.
+ */
+const ALLOWED_REASONS: ReadonlySet<string> = new Set([
+  'SIGINT',
+  'SIGTERM',
+  'aborted',
+  'archive_conflict',
+  'archive_state_present',
+  'archive_unavailable',
+  'auth_failed',
+  'buffer_lost',
+  'concurrent_modification',
+  'explicit env config, no fallbacks',
+  'in-process ingress only; no transport and no external input',
+  'invalid_task_row',
+  'loopback API/WebSocket not implemented',
+  'no health transport; status is available in-process only',
+  'no transport receives events yet',
+  'no work is dispatched',
+  'normalize crashed personas; nothing is auto-started',
+  'not_implemented',
+  'persona_budget_exceeded',
+  'probe_budget_exceeded',
+  'processing_failed',
+  'queue_overflow',
+  'rate_limited',
+  'recoverRuntime is fail-closed; no scheduler in this phase',
+  'requested',
+  'row_budget_exceeded',
+  'running with an empty handler map; tasks are not dispatched',
+  'runtime_not_implemented',
+  'scan_query_budget_exceeded',
+  'schema_invalid',
+  'startup_failed',
+  'stop_requested',
+  'ttl_expired',
+  'unexpected_event_status',
+  'untrusted_source',
+  'atomic, data-dir scoped, owner-checked release',
+  'directory + real write probe, no temp fallback',
+  'expected P1 shape, column order included',
+  'packaged migrations, checksum verified',
+  'single writer, WAL',
+  'structured JSON lines, content redacted',
+]);
+
 const REDACTED = '[redacted]';
+const INVALID_EVENT = 'invalid_event';
 const MAX_DEPTH = 4;
 const MAX_ARRAY = 20;
+
+function eventName(event: string): string {
+  return EVENT_NAME.test(event) ? event : INVALID_EVENT;
+}
+
+function adapterEventRef(value: unknown): string {
+  if (typeof value !== 'string' || !ADAPTER_EVENT_REF.test(value)) {
+    return REDACTED;
+  }
+  const digest = createHash('sha256').update(value).digest('hex').slice(0, 16);
+  return `ref_${digest}`;
+}
+
+function reasonValue(value: unknown): string {
+  return typeof value === 'string' && ALLOWED_REASONS.has(value) ? value : REDACTED;
+}
 
 function sanitizeValue(value: unknown, depth: number): unknown {
   if (value === null || typeof value === 'number' || typeof value === 'boolean') {
@@ -159,6 +246,19 @@ function sanitizeValue(value: unknown, depth: number): unknown {
 function sanitizeRecord(record: Record<string, unknown>, depth: number): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(record)) {
+    if (key === 'source' || key === 'adapterId') {
+      // No adapter registry is implemented. A pattern match is not registration.
+      result[key] = REDACTED;
+      continue;
+    }
+    if (key === 'adapterEventRef') {
+      result[key] = adapterEventRef(value);
+      continue;
+    }
+    if (key === 'reason') {
+      result[key] = reasonValue(value);
+      continue;
+    }
     if (!ALLOWED_LOG_KEYS.has(key) || REDACTED_KEY.test(key)) {
       result[key] = REDACTED;
       continue;
@@ -184,7 +284,7 @@ export function createLogger(options: LoggerOptions): Logger {
     const record: Record<string, unknown> = {
       ts: now().toISOString(),
       level,
-      event,
+      event: eventName(event),
       ...sanitizeRecord(bindings, 0),
       ...sanitizeRecord(fields ?? {}, 0),
     };
