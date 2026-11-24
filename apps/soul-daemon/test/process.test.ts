@@ -106,6 +106,29 @@ describe('real process lifecycle', { timeout: TEST_TIMEOUT }, () => {
   );
 
   it(
+    'aborts startup on SIGTERM and releases the lock without reaching RUNNING',
+    async () => {
+      const dir = tempDir();
+
+      const spawned = spawnDaemon({
+        env: { SOUL_DATA_DIR: dir, SOUL_TEST_SIGNAL_AT: 'MIGRATING' },
+        entry: SIGNAL_RUNNER,
+      });
+      daemons.push(spawned);
+
+      await spawned.waitFor((record) => isPhase(record, 'MIGRATING'));
+      const code = await spawned.waitForExit();
+
+      expect(code).toBe(0);
+      expect(spawned.records.some((record) => record['event'] === 'signal_received')).toBe(true);
+      expect(spawned.records.some((record) => record['event'] === 'boot_aborted')).toBe(true);
+      expect(spawned.records.some((record) => isPhase(record, 'RUNNING'))).toBe(false);
+      expect(existsSync(join(dir, LOCK_FILE_NAME))).toBe(false);
+    },
+    TEST_TIMEOUT,
+  );
+
+  it(
     'holds the lock while RUNNING',
     async () => {
       const dir = tempDir();

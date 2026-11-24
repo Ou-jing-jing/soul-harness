@@ -6,6 +6,7 @@ import { loadConfig, type DaemonConfig } from '../src/config.js';
 import { SoulDaemon } from '../src/daemon.js';
 import { DaemonError } from '../src/errors.js';
 import { LOCK_FILE_NAME } from '../src/lock.js';
+import { exitCodeFor } from '../src/main.js';
 import {
   createRecordingLogger,
   makeTempDir,
@@ -42,7 +43,14 @@ interface SeenScheduler {
 const control = vi.hoisted(() => {
   return {
     mode: 'passthrough' as
-      'passthrough' | 'ingress' | 'scheduler-create' | 'scheduler-start' | 'stop-hang',
+      | 'passthrough'
+      | 'ingress'
+      | 'ingress-close-fail'
+      | 'scheduler-create'
+      | 'scheduler-start'
+      | 'stop-hang'
+      | 'stop-reject'
+      | 'store-close-fail',
     ingress: [] as SeenIngress[],
     schedulers: [] as SeenScheduler[],
     ingressCloses: 0,
@@ -73,6 +81,9 @@ vi.mock('@soul-harness/runtime', async (importOriginal) => {
             return () => {
               control.ingressCloses += 1;
               target.close();
+              if (control.mode === 'ingress-close-fail') {
+                throw new Error('ingress close failed');
+              }
             };
           }
           return Reflect.get(target, prop, receiver);
@@ -89,6 +100,14 @@ vi.mock('@soul-harness/runtime', async (importOriginal) => {
         handlers: options.handlers,
         now: options.now ?? Date.now,
       });
+      if (control.mode === 'store-close-fail') {
+        const store = options.store as { close(): void };
+        const close = store.close.bind(store);
+        store.close = () => {
+          close();
+          throw new Error('store close failed');
+        };
+      }
       if (control.mode === 'scheduler-create') {
         throw new Error('scheduler refused');
       }
@@ -120,6 +139,29 @@ vi.mock('@soul-harness/runtime', async (importOriginal) => {
           stats: () => ({ state: 'running' as const, activeHandlers: 0, activeUnits: 0 }),
         };
         return hanging;
+      }
+      if (control.mode === 'stop-reject') {
+        return {
+          get state() {
+            return 'running' as const;
+          },
+          start() {
+            return undefined;
+          },
+          stop() {
+            control.stopCalls += 1;
+            return Promise.reject(new Error('stop failed'));
+          },
+          wake() {
+            return undefined;
+          },
+          tick: () => Promise.resolve({ personasVisited: 0, claimed: 0, dispatched: 0 }),
+          enqueueTask: () => Promise.reject(new Error('no handler')),
+          pauseTask: () => Promise.reject(new Error('no handler')),
+          resumeTask: () => Promise.reject(new Error('no handler')),
+          cancelTask: () => Promise.reject(new Error('no handler')),
+          stats: () => ({ state: 'running' as const, activeHandlers: 0, activeUnits: 0 }),
+        };
       }
       const scheduler = actual.createScheduler(options);
       if (control.mode === 'scheduler-start') {
@@ -269,7 +311,7 @@ describe('READY failure paths', () => {
     expect(control.stopCalls).toBe(1);
     expect(daemon.status.storeOpen).toBe(true);
     expect(daemon.status.lockHeld).toBe(true);
-    expect(daemon.phase).toBe('CLOSING');
+    expect(daemon.phase).toBe('DRAINING');
 
     const release = control.releaseStop;
     if (release === null) {
@@ -282,5 +324,68 @@ describe('READY failure paths', () => {
     expect(daemon.status.storeOpen).toBe(false);
     expect(daemon.status.lockHeld).toBe(false);
     expect(existsSync(join(dir, LOCK_FILE_NAME))).toBe(false);
+  });
+
+  it('keeps the lock and exits as shutdown_failed when store.close throws', async () => {
+    control.mode = 'store-close-fail';
+    const dir = tempDir();
+    const { daemon } = makeDaemon(dir);
+    await daemon.start();
+
+    const first = daemon.stop('close-failed');
+    const second = daemon.stop('again');
+    expect(second).toBe(first);
+
+    const caught = await first.catch((error: unknown) => error);
+    expect(caught).toMatchObject({
+      code: 'shutdown_failed',
+      details: { failures: 1, first: 'sqlite_open' },
+    });
+    expect(daemon.phase).toBe('STOPPED');
+    expect(daemon.status.storeOpen).toBe(false);
+    expect(daemon.status.lockHeld).toBe(true);
+    expect(existsSync(join(dir, LOCK_FILE_NAME))).toBe(true);
+    expect(exitCodeFor(caught)).toBe(6);
+  });
+
+  it('records an ingress close failure and still releases the lock', async () => {
+    control.mode = 'ingress-close-fail';
+    const dir = tempDir();
+    const { daemon } = makeDaemon(dir);
+    await daemon.start();
+
+    const caught = await daemon.stop('ingress-close').catch((error: unknown) => error);
+
+    expect(caught).toMatchObject({
+      code: 'shutdown_failed',
+      details: { failures: 1, first: 'event_bus' },
+    });
+    expect(daemon.phase).toBe('STOPPED');
+    expect(daemon.status.lockHeld).toBe(false);
+    expect(existsSync(join(dir, LOCK_FILE_NAME))).toBe(false);
+    expect(exitCodeFor(caught)).toBe(6);
+  });
+
+  it('does not close the store when scheduler.stop rejects', async () => {
+    control.mode = 'stop-reject';
+    const dir = tempDir();
+    const { daemon } = makeDaemon(dir);
+    await daemon.start();
+
+    const caught = await daemon.stop('stop-failed').catch((error: unknown) => error);
+
+    expect(caught).toMatchObject({
+      code: 'shutdown_failed',
+      details: { first: 'scheduler' },
+    });
+    expect(daemon.phase).toBe('DRAINING');
+    expect(daemon.status.storeOpen).toBe(true);
+    expect(daemon.status.lockHeld).toBe(true);
+    expect(existsSync(join(dir, LOCK_FILE_NAME))).toBe(true);
+    expect(exitCodeFor(caught)).toBe(6);
+    await expect(daemon.stop('again')).rejects.toBe(caught);
+
+    const store = control.schedulers[0]?.store as { close(): void } | undefined;
+    store?.close();
   });
 });
