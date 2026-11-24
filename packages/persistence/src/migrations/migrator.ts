@@ -21,7 +21,7 @@ import { databaseOf, type Store } from '../db/store.js';
 import { allRows, oneRow } from '../db/rows.js';
 import { PersistenceError } from '../errors.js';
 import { assertStoreUsable } from '../tx/coordinator.js';
-import { P1_INDEXES, P1_TABLE_COLUMNS } from './expected-schema.js';
+import { P1_INDEXES, P1_SCHEMA_SQL, P1_TABLE_COLUMNS } from './expected-schema.js';
 import { formatMigrationVersion, loadMigrationsFromDir, normalizeMigrations } from './load.js';
 import type { AppliedMigration, MigrateOptions, MigrateResult, MigrationFile } from './types.js';
 
@@ -186,7 +186,10 @@ export function migrate(store: Store, options: MigrateOptions = {}): MigrateResu
  * Proves the database really has the expected P1 shape.
  *
  * Column order is compared too: it catches a table recreated with a different
- * column set that still satisfies "the name exists".
+ * column set that still satisfies "the name exists". The normalized
+ * `sqlite_master` SQL is compared as well, so a kept index name with the
+ * UNIQUE flag or partial predicate removed, or a CHECK / foreign key deleted
+ * from a table, is still a mismatch.
  *
  * A store whose cleanup failed is refused before any schema query runs: the
  * connection state is unknown, so a successful verdict would be meaningless.
@@ -226,6 +229,20 @@ export function verifySchema(store: Store): void {
     }
   }
 
+  for (const [name, expectedSql] of Object.entries(P1_SCHEMA_SQL)) {
+    const row = oneRow<{ sql?: string | null }>(
+      db.prepare('SELECT sql FROM sqlite_master WHERE name = ?'),
+      name,
+    );
+    if (row?.sql == null || row.sql === '') {
+      problems.push(`schema fingerprint missing: ${name}`);
+      continue;
+    }
+    if (normalizeSchemaSql(row.sql) !== expectedSql) {
+      problems.push(`schema fingerprint mismatch: ${name}`);
+    }
+  }
+
   if (problems.length > 0) {
     throw new PersistenceError(
       'schema_mismatch',
@@ -235,4 +252,16 @@ export function verifySchema(store: Store): void {
       },
     );
   }
+}
+
+/** Drops line comments and collapses whitespace so formatting is not the fingerprint. */
+function normalizeSchemaSql(sql: string): string {
+  const withoutComments = sql
+    .split('\n')
+    .map((line) => {
+      const mark = line.indexOf('--');
+      return mark === -1 ? line : line.slice(0, mark);
+    })
+    .join('\n');
+  return withoutComments.replace(/\s+/g, ' ').trim();
 }

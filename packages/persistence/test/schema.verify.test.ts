@@ -116,6 +116,71 @@ describe('verifySchema', () => {
       expect((error as PersistenceError).details?.['problems']).toContain('missing table: tasks');
     }
   });
+
+  it('reports an index that kept its name but lost UNIQUE', () => {
+    db.exec('DROP INDEX ux_events_dedupe');
+    db.exec(
+      'CREATE INDEX ux_events_dedupe ON events (persona_id, adapter_id, source, adapter_event_ref)',
+    );
+
+    try {
+      verifySchema(store);
+      expect.unreachable('a non-unique dedupe index must be reported');
+    } catch (error) {
+      const problems = (error as PersistenceError).details?.['problems'];
+      expect(problems).toContain('schema fingerprint mismatch: ux_events_dedupe');
+      expect(problems).not.toContain('missing index: ux_events_dedupe');
+    }
+  });
+
+  it('reports a partial index that kept its name but lost the predicate', () => {
+    db.exec('DROP INDEX ux_sessions_external');
+    db.exec(
+      'CREATE UNIQUE INDEX ux_sessions_external ON sessions (persona_id, adapter_id, external_id)',
+    );
+
+    try {
+      verifySchema(store);
+      expect.unreachable('a partial index without its predicate must be reported');
+    } catch (error) {
+      expect((error as PersistenceError).details?.['problems']).toContain(
+        'schema fingerprint mismatch: ux_sessions_external',
+      );
+    }
+  });
+
+  it('reports a CHECK constraint removed while the column names stay', () => {
+    db.exec(`
+      CREATE TABLE tasks_unchecked (
+        id TEXT PRIMARY KEY,
+        persona_id TEXT NOT NULL REFERENCES personas(id),
+        kind TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        state TEXT NOT NULL,
+        priority INTEGER NOT NULL DEFAULT 0,
+        run_id TEXT,
+        payload_json TEXT,
+        scheduled_at INTEGER,
+        started_at INTEGER,
+        finished_at INTEGER,
+        attempt INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT INTO tasks_unchecked SELECT * FROM tasks;
+      DROP TABLE tasks;
+      ALTER TABLE tasks_unchecked RENAME TO tasks;
+      CREATE INDEX ix_tasks_persona_state ON tasks (persona_id, state, scheduled_at);
+    `);
+
+    try {
+      verifySchema(store);
+      expect.unreachable('a table without its CHECK constraints must be reported');
+    } catch (error) {
+      const problems = (error as PersistenceError).details?.['problems'];
+      expect(problems).toContain('schema fingerprint mismatch: tasks');
+      expect(problems).not.toContain('column mismatch: tasks');
+      expect(problems).not.toContain('missing index: ix_tasks_persona_state');
+    }
+  });
 });
 
 describe('database constraints', () => {
