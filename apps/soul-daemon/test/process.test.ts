@@ -18,6 +18,7 @@ import {
   prepareDatabase,
   readTask,
   seedPersona,
+  seedQueuedTask,
   seedRunningTask,
 } from './helpers/recovery-seed.js';
 
@@ -47,12 +48,87 @@ function isPhase(record: LogRecord, phase: string): boolean {
   return record['event'] === 'phase_entered' && record['phase'] === phase;
 }
 
+/** Opens the real file and checks the migration table is still readable. */
+function assertDatabaseIntact(dir: string): void {
+  const db = new DatabaseSync(join(dir, 'soul.db'));
+  try {
+    const row = db.prepare('SELECT version FROM schema_migrations WHERE version = 1').get() as
+      { version: number } | undefined;
+    expect(row?.version).toBe(1);
+  } finally {
+    db.close();
+  }
+}
+
+function openedDatabase(spawned: SpawnedDaemon): boolean {
+  return spawned.records.some(
+    (record) => record['event'] === 'step_ok' && record['step'] === 'sqlite_open',
+  );
+}
+
+/**
+ * Remembers `close` so a race can see the loser exit without waiting for a
+ * `RUNNING` log that will never arrive. The listener is attached before the
+ * first await, so the event cannot be missed.
+ */
+function watchClose(spawned: SpawnedDaemon): { code(): number | null | undefined } {
+  let code: number | null | undefined;
+  spawned.child.once('close', (value) => {
+    code = value;
+  });
+  return {
+    code: () => code,
+  };
+}
+
+async function waitForOneRunning(
+  first: SpawnedDaemon,
+  second: SpawnedDaemon,
+  timeoutMs: number,
+): Promise<{ winner: SpawnedDaemon; loser: SpawnedDaemon; loserCode: number | null }> {
+  const firstClose = watchClose(first);
+  const secondClose = watchClose(second);
+  const deadline = Date.now() + timeoutMs;
+
+  for (;;) {
+    const pairs = [
+      { winner: first, loser: second, loserCode: secondClose.code() },
+      { winner: second, loser: first, loserCode: firstClose.code() },
+    ];
+    for (const pair of pairs) {
+      if (
+        pair.winner.records.some((record) => isPhase(record, 'RUNNING')) &&
+        pair.loserCode !== undefined
+      ) {
+        return { winner: pair.winner, loser: pair.loser, loserCode: pair.loserCode };
+      }
+    }
+    if (
+      first.records.some((record) => isPhase(record, 'RUNNING')) &&
+      second.records.some((record) => isPhase(record, 'RUNNING'))
+    ) {
+      throw new Error('both processes reached RUNNING');
+    }
+    if (firstClose.code() !== undefined && secondClose.code() !== undefined) {
+      throw new Error(`both processes exited\n${first.stderr.join('')}\n${second.stderr.join('')}`);
+    }
+    if (Date.now() > deadline) {
+      throw new Error(
+        `timed out waiting for one RUNNING process and one exit\n${first.stderr.join('')}\n${second.stderr.join('')}`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 const TEST_TIMEOUT = 60_000;
 
 beforeAll(() => {
   buildDaemonApp();
 }, TEST_TIMEOUT);
 
+// Exit code 6 stays an in-process assertion (store.close failure). These
+// process tests do not forge that failure.
 describe('real process lifecycle', { timeout: TEST_TIMEOUT }, () => {
   it(
     'rejects a missing data directory with exit code 2',
@@ -84,9 +160,14 @@ describe('real process lifecycle', { timeout: TEST_TIMEOUT }, () => {
   );
 
   it(
-    'starts, and stops cleanly when a signal arrives',
+    'stops cleanly on SIGTERM: scheduler stops before the process, database stays openable',
     async () => {
       const dir = tempDir();
+      prepareDatabase(dir, (store) => {
+        seedPersona(store, 1);
+        seedQueuedTask(store, 1);
+      });
+      const before = readTask(dir, 1);
 
       const spawned = spawnDaemon({ env: { SOUL_DATA_DIR: dir }, entry: SIGNAL_RUNNER });
       daemons.push(spawned);
@@ -96,11 +177,25 @@ describe('real process lifecycle', { timeout: TEST_TIMEOUT }, () => {
       const code = await spawned.waitForExit();
       expect(code).toBe(0);
       expect(spawned.records.some((record) => record['event'] === 'signal_received')).toBe(true);
-      expect(spawned.records.some((record) => record['event'] === 'daemon_stopped')).toBe(true);
+      expect(spawned.records.some((record) => record['event'] === 'scheduler_started')).toBe(true);
 
-      // The database survives the stop; the lock does not.
+      const stoppedAt = spawned.records.findIndex(
+        (record) => record['event'] === 'scheduler_stopped',
+      );
+      const daemonStoppedAt = spawned.records.findIndex(
+        (record) => record['event'] === 'daemon_stopped',
+      );
+      expect(stoppedAt).toBeGreaterThanOrEqual(0);
+      expect(daemonStoppedAt).toBeGreaterThan(stoppedAt);
+
       expect(existsSync(join(dir, 'soul.db'))).toBe(true);
       expect(existsSync(join(dir, LOCK_FILE_NAME))).toBe(false);
+      assertDatabaseIntact(dir);
+      expect(readTask(dir, 1)).toMatchObject({
+        state: 'queued',
+        attempt: 0,
+        runId: before?.runId ?? null,
+      });
     },
     TEST_TIMEOUT,
   );
@@ -179,6 +274,27 @@ describe('real process lifecycle', { timeout: TEST_TIMEOUT }, () => {
   );
 
   it(
+    'only one of two real processes racing the same directory reaches RUNNING',
+    async () => {
+      const dir = tempDir();
+
+      const first = spawnDaemon({ env: { SOUL_DATA_DIR: dir } });
+      const second = spawnDaemon({ env: { SOUL_DATA_DIR: dir } });
+      daemons.push(first, second);
+
+      const { winner, loser, loserCode } = await waitForOneRunning(first, second, 15_000);
+
+      expect(loserCode).toBe(4);
+      expect(loser.records.some((record) => isPhase(record, 'RUNNING'))).toBe(false);
+      expect(openedDatabase(loser)).toBe(false);
+      expect(openedDatabase(winner)).toBe(true);
+      expect(winner.child.exitCode).toBeNull();
+      expect(existsSync(join(dir, 'soul.db'))).toBe(true);
+    },
+    TEST_TIMEOUT,
+  );
+
+  it(
     'runs two instances on different data directories',
     async () => {
       const a = spawnDaemon({ env: { SOUL_DATA_DIR: tempDir() } });
@@ -222,9 +338,14 @@ describe('real process lifecycle', { timeout: TEST_TIMEOUT }, () => {
   );
 
   it(
-    'survives a crash: the next start takes over the stale lock and reopens SQLite',
+    'survives SIGKILL: the database stays intact and the next start keeps the task row',
     async () => {
       const dir = tempDir();
+      prepareDatabase(dir, (store) => {
+        seedPersona(store, 1);
+        seedQueuedTask(store, 1);
+      });
+      const before = readTask(dir, 1);
 
       const crashed = spawnDaemon({ env: { SOUL_DATA_DIR: dir } });
       daemons.push(crashed);
@@ -233,19 +354,30 @@ describe('real process lifecycle', { timeout: TEST_TIMEOUT }, () => {
       crashed.child.kill('SIGKILL');
       const crashCode = await crashed.waitForExit();
       expect(crashCode).not.toBe(0);
-      // A killed process cannot have cleaned up or claimed a clean stop.
       expect(crashed.records.some((record) => record['event'] === 'daemon_stopped')).toBe(false);
       expect(existsSync(join(dir, LOCK_FILE_NAME))).toBe(true);
+      assertDatabaseIntact(dir);
+      expect(readTask(dir, 1)).toMatchObject({
+        state: 'queued',
+        attempt: 0,
+        runId: before?.runId ?? null,
+      });
 
       const restarted = spawnDaemon({ env: { SOUL_DATA_DIR: dir } });
       daemons.push(restarted);
       await restarted.waitFor((record) => isPhase(record, 'RUNNING'));
 
-      const lock = JSON.parse(
-        (await import('node:fs')).readFileSync(join(dir, LOCK_FILE_NAME), 'utf8'),
-      ) as Record<string, unknown>;
+      const lock = JSON.parse(readFileSync(join(dir, LOCK_FILE_NAME), 'utf8')) as Record<
+        string,
+        unknown
+      >;
       expect(lock['pid']).toBe(restarted.child.pid);
       expect(restarted.records.some((record) => record['event'] === 'daemon_running')).toBe(true);
+      expect(readTask(dir, 1)).toMatchObject({
+        state: 'queued',
+        attempt: 0,
+        runId: before?.runId ?? null,
+      });
     },
     TEST_TIMEOUT,
   );
@@ -330,6 +462,8 @@ describe('real process lifecycle', { timeout: TEST_TIMEOUT }, () => {
       expect(first.records.some((record) => record['event'] === 'scheduler_started')).toBe(false);
       expect(first.records.some((record) => record['event'] === 'daemon_running')).toBe(false);
       expect(existsSync(join(dir, LOCK_FILE_NAME))).toBe(false);
+      expect(existsSync(join(dir, 'soul.db'))).toBe(true);
+      assertDatabaseIntact(dir);
       expect(readTask(dir, 1)).toMatchObject({
         state: 'queued',
         attempt: 1,
