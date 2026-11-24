@@ -13,9 +13,11 @@
  */
 
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { clearTimeout, setTimeout } from 'node:timers';
 
 import {
   ERROR_MESSAGES,
@@ -536,6 +538,158 @@ const closeConsumerStore = ({ dir, store }) => {
   }
 }
 
+// 3.5 A claimed task that dies RUNNING is requeued, claimed again under a new
+// run id, and completed by the Scheduler itself.
+//
+// The first claim runs in a child process that exits without settling, which
+// is the crash. The stale run is rejected while the second claim is still
+// RUNNING. The handler is then released so the Scheduler, not the test, writes
+// the completion.
+{
+  const dir = mkdtempSync(join(tmpdir(), 'sh-consumer-redispatch-'));
+  const file = join(dir, 'soul.db');
+  const taskId = `tsk_${'0'.repeat(24)}09`;
+  const opened = persistence.openStore({ file });
+  persistence.migrate(opened);
+  const seeded = persistence.createRepositories(opened);
+  seeded.personas.insert({
+    id: PERSONA,
+    displayName: 'Redispatch',
+    state: 'RUNNING',
+    createdAt: NOW,
+    updatedAt: NOW,
+  });
+  seeded.tasks.insertQueuedTask({
+    id: taskId,
+    personaId: PERSONA,
+    kind: 'thought.run',
+    channel: 'inner',
+  });
+  opened.close();
+
+  const childSource = `import * as persistence from '@soul-harness/persistence';
+import * as runtime from '@soul-harness/runtime';
+
+const file = process.argv[1];
+const personaId = process.argv[2];
+const taskId = process.argv[3];
+const store = persistence.openStore({ file });
+const repos = persistence.createRepositories(store);
+const scheduler = runtime.createScheduler({
+  store,
+  logger: { debug() {}, info() {}, warn() {}, error() {} },
+  policy: { maxAttempts: 3, retryBackoffMs: 0 },
+  handlers: { 'thought.run': () => new Promise(() => {}) },
+  now: () => ${NOW},
+  timers: { setTimeout: () => 0, clearTimeout: () => {} },
+});
+scheduler.start();
+await scheduler.tick();
+const row = repos.tasks.getById({ personaId, id: taskId });
+if (row === null || row.state !== 'running' || row.runId === null) {
+  console.error('claim did not leave a running row');
+  process.exit(1);
+}
+process.stdout.write(JSON.stringify({ state: row.state, attempt: row.attempt, runId: row.runId }));
+try { store.close(); } catch { /* the process is exiting */ }
+process.exit(0);
+`;
+
+  const claimed = await new Promise((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      ['--input-type=module', '--eval', childSource, file, PERSONA, taskId],
+      { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => child.kill('SIGKILL'), 10_000);
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+    child.on('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (code !== 0) {
+        reject(new Error(`crash claim exited ${code}: ${stderr}`));
+        return;
+      }
+      resolve(JSON.parse(stdout));
+    });
+  });
+
+  assert.equal(claimed.state, 'running');
+  assert.equal(claimed.attempt, 1);
+  assert.equal(typeof claimed.runId, 'string');
+  const runA = claimed.runId;
+
+  const store = persistence.openStore({ file });
+  try {
+    const repos = persistence.createRepositories(store);
+    const report = await runtime.recoverRuntime({
+      store,
+      logger: noop,
+      policy: POLICY,
+      now: () => NOW,
+    });
+    assert.equal(report.incomplete, null, 'recovery after a crash must complete');
+    assert.equal(report.tasks.requeued, 1);
+    const requeued = repos.tasks.getById({ personaId: PERSONA, id: taskId });
+    assert.equal(requeued.state, 'queued');
+    assert.equal(requeued.attempt, 1);
+    assert.equal(requeued.runId, runA);
+
+    let releaseHandler;
+    const gate = new Promise((resolve) => {
+      releaseHandler = resolve;
+    });
+    const scheduler = runtime.createScheduler({
+      store,
+      logger: noop,
+      policy: POLICY,
+      handlers: { 'thought.run': () => gate },
+      now: () => NOW,
+      timers: noopTimers,
+    });
+    scheduler.start();
+    await scheduler.tick();
+    const second = repos.tasks.getById({ personaId: PERSONA, id: taskId });
+    assert.equal(second.state, 'running');
+    assert.equal(second.attempt, 2);
+    assert.notEqual(second.runId, runA);
+    const runB = second.runId;
+
+    const stale = repos.tasks.completeTask({
+      id: taskId,
+      personaId: PERSONA,
+      runId: runA,
+      expectedAttempt: 1,
+      finishedAt: NOW,
+    });
+    assert.equal(stale, null, 'the crashed run must not be able to complete the task');
+    assert.equal(repos.tasks.getById({ personaId: PERSONA, id: taskId }).state, 'running');
+    assert.equal(repos.tasks.getById({ personaId: PERSONA, id: taskId }).runId, runB);
+
+    releaseHandler();
+    await scheduler.stop();
+    const done = repos.tasks.getById({ personaId: PERSONA, id: taskId });
+    assert.equal(done.state, 'done', 'the scheduler must complete the recovered run');
+    assert.equal(done.runId, runB);
+    assert.equal(done.attempt, 2);
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+}
+
 console.log(
-  `consumer-check ok: package-name imports resolved, ${SCHEMA_IDS.length} schemas, persistence E2E ok, runtime persona lifecycle and P1 ingress ok, recovery and scheduler E2E ok, Store lease mutual exclusion ok`,
+  `consumer-check ok: package-name imports resolved, ${SCHEMA_IDS.length} schemas, persistence E2E ok, runtime persona lifecycle and P1 ingress ok, recovery and scheduler E2E ok, Store lease mutual exclusion ok, recovered task redispatch ok`,
 );
