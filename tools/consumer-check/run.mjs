@@ -539,12 +539,12 @@ const closeConsumerStore = ({ dir, store }) => {
 }
 
 // 3.5 A claimed task that dies RUNNING is requeued, claimed again under a new
-// run id, and only that new run can complete it.
+// run id, and completed by the Scheduler itself.
 //
 // The first claim runs in a child process that exits without settling, which
-// is the crash. `completeTask(run A)` is attempted while the second claim is
-// still RUNNING, so a null result means the stale run was rejected rather than
-// "the task was already done".
+// is the crash. The stale run is rejected while the second claim is still
+// RUNNING. The handler is then released so the Scheduler, not the test, writes
+// the completion.
 {
   const dir = mkdtempSync(join(tmpdir(), 'sh-consumer-redispatch-'));
   const file = join(dir, 'soul.db');
@@ -676,23 +676,12 @@ process.exit(0);
     });
     assert.equal(stale, null, 'the crashed run must not be able to complete the task');
     assert.equal(repos.tasks.getById({ personaId: PERSONA, id: taskId }).state, 'running');
-
-    const live = repos.tasks.completeTask({
-      id: taskId,
-      personaId: PERSONA,
-      runId: runB,
-      expectedAttempt: 2,
-      finishedAt: NOW,
-    });
-    assert.notEqual(live, null, 'the run that holds the task must be able to complete it');
-    assert.equal(live.state, 'done');
-    assert.equal(live.runId, runB);
-    assert.equal(live.attempt, 2);
+    assert.equal(repos.tasks.getById({ personaId: PERSONA, id: taskId }).runId, runB);
 
     releaseHandler();
     await scheduler.stop();
     const done = repos.tasks.getById({ personaId: PERSONA, id: taskId });
-    assert.equal(done.state, 'done');
+    assert.equal(done.state, 'done', 'the scheduler must complete the recovered run');
     assert.equal(done.runId, runB);
     assert.equal(done.attempt, 2);
   } finally {
