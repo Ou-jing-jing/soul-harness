@@ -47,6 +47,7 @@ import { ensureDataDir } from './data-dir.js';
 import { DaemonError, isDaemonError } from './errors.js';
 import { acquireInstanceLock, type InstanceLock } from './lock.js';
 import type { Logger } from './logger.js';
+import { loadOrCreateApiToken, type ApiTokenVerifier } from './api/token.js';
 import {
   CURRENT_RUNTIME_SURFACE,
   READY_TARGET_SURFACE,
@@ -165,6 +166,7 @@ export class SoulDaemon {
   #lock: InstanceLock | null = null;
   #store: Store | null = null;
   #lifecycle: PersonaRecoveryOutcome['lifecycle'] | null = null;
+  #apiToken: ApiTokenVerifier | null = null;
   #ingress: ReturnType<typeof createDaemonIngress> | null = null;
   #scheduler: ReturnType<typeof createDaemonScheduler> | null = null;
   #surface: DaemonRuntimeSurface = CURRENT_RUNTIME_SURFACE;
@@ -211,6 +213,11 @@ export class SoulDaemon {
       components: this.#surface.components,
       capabilities: this.#surface.capabilities,
     };
+  }
+
+  /** E1 seam for a future API server; no token is exposed. */
+  verifyApiToken(candidate: string): boolean {
+    return this.#apiToken?.verify(candidate) ?? false;
   }
 
   /** Resolves once the daemon has fully stopped; rejects if cleanup failed. */
@@ -284,7 +291,11 @@ export class SoulDaemon {
       });
       await this.#boundary();
 
-      // 5. SQLite
+      // 5. local API token, before the database is touched. The token is only
+      // retained as a verifier; it is never logged or returned.
+      this.#apiToken = loadOrCreateApiToken(dataDir);
+
+      // 6. SQLite
       const databaseFile = join(dataDir, 'soul.db');
       const store = openStore({ file: databaseFile });
       this.#store = store;
@@ -292,7 +303,7 @@ export class SoulDaemon {
       this.#logger.info('step_ok', { step: 'sqlite_open', databaseFile });
       await this.#boundary();
 
-      // 6/7. migrations + schema verification
+      // 7/8. migrations + schema verification
       this.#enter('MIGRATING');
       const migration = migrate(store);
       verifySchema(store);
@@ -352,6 +363,7 @@ export class SoulDaemon {
       };
     } catch (error) {
       const cleanup = await this.#releaseAll();
+      this.#apiToken = null;
       this.#phase = 'FAILED';
 
       const code = isDaemonError(error) ? error.code : 'startup_failed';
@@ -516,6 +528,7 @@ export class SoulDaemon {
     if (outcomes.some((entry) => entry.step === 'sqlite_open')) {
       this.#store = null;
       this.#lifecycle = null;
+      this.#apiToken = null;
       this.#surface = CURRENT_RUNTIME_SURFACE;
     }
   }

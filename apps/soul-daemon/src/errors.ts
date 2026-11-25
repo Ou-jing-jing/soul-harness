@@ -29,6 +29,10 @@ export const DAEMON_ERROR_CODES = [
   'recovery_incomplete',
   'event_bus_start_failed',
   'scheduler_start_failed',
+  // SH-009 E1 local API token preparation
+  'api_token_invalid',
+  'api_token_insecure',
+  'api_token_io_failed',
   'shutdown_failed',
   'invalid_transition',
 ] as const;

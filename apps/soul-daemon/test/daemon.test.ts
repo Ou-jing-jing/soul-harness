@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { loadConfig } from '../src/config.js';
 import { SoulDaemon } from '../src/daemon.js';
 import { isDaemonError } from '../src/errors.js';
+import { API_TOKEN_FILE_NAME } from '../src/api/token.js';
 import { LOCK_FILE_NAME } from '../src/lock.js';
 import type { LogRecord } from './helpers/harness.js';
 import {
@@ -52,6 +53,13 @@ describe('startup', () => {
     expect(report.appliedMigrations).toStrictEqual([1]);
     expect(report.currentVersion).toBe(1);
     expect(existsSync(join(dir, 'soul.db'))).toBe(true);
+
+    const tokenPath = join(dir, API_TOKEN_FILE_NAME);
+    expect(existsSync(tokenPath)).toBe(true);
+    const token = readFileSync(tokenPath, 'utf8').replace(/\r?\n$/u, '');
+    expect(daemon.verifyApiToken(token)).toBe(true);
+    expect(daemon.verifyApiToken(`${token}x`)).toBe(false);
+    expect(JSON.stringify(records)).not.toContain(token);
 
     const lockPath = join(dir, LOCK_FILE_NAME);
     expect(existsSync(lockPath)).toBe(true);
@@ -121,7 +129,29 @@ describe('startup', () => {
     ).toBe(true);
 
     await daemon.stop('test-finished');
+    expect(daemon.verifyApiToken(token)).toBe(false);
     expect(daemon.status.scheduler).toBeNull();
+  });
+
+  it('fails before opening the database when the API token file is invalid', async () => {
+    const dir = tempDir();
+    writeFileSync(join(dir, API_TOKEN_FILE_NAME), 'invalid', {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+    const { daemon } = makeDaemon(dir);
+
+    let caught: unknown;
+    try {
+      await daemon.start();
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(isDaemonError(caught) && caught.code).toBe('api_token_invalid');
+    expect(daemon.phase).toBe('FAILED');
+    expect(existsSync(join(dir, 'soul.db'))).toBe(false);
+    expect(readFileSync(join(dir, API_TOKEN_FILE_NAME), 'utf8')).toBe('invalid');
   });
 
   it('fails before opening the database when the lock is taken', async () => {
@@ -139,8 +169,9 @@ describe('startup', () => {
 
     expect(isDaemonError(caught)).toBe(true);
     expect(daemon.phase).toBe('FAILED');
-    // The lock failure happens before SQLite is touched.
+    // The lock failure happens before SQLite or the API token is touched.
     expect(existsSync(join(dir, 'soul.db'))).toBe(false);
+    expect(existsSync(join(dir, API_TOKEN_FILE_NAME))).toBe(false);
 
     other.release();
   });
