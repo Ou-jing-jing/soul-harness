@@ -44,6 +44,8 @@ describe('startup', () => {
     const dir = tempDir();
     const { daemon, records } = makeDaemon(dir);
 
+    expect(daemon.status.scheduler).toBeNull();
+
     const report = await daemon.start();
 
     expect(report.phase).toBe('RUNNING');
@@ -99,6 +101,12 @@ describe('startup', () => {
     expect(daemon.status.components).toBe(report.components);
     expect(daemon.status.capabilities).toBe(report.capabilities);
     expect(daemon.status.personaLifecycleAssembled).toBe(true);
+    expect(daemon.status.recovery).toEqual(report.recovery);
+    expect(daemon.status.scheduler).toEqual({
+      state: 'running',
+      activeHandlers: 0,
+      activeUnits: 0,
+    });
     expect(daemon.status.bootId).toBe(report.bootId);
     expect(lock['bootToken']).toBe(report.bootId);
 
@@ -113,6 +121,7 @@ describe('startup', () => {
     ).toBe(true);
 
     await daemon.stop('test-finished');
+    expect(daemon.status.scheduler).toBeNull();
   });
 
   it('fails before opening the database when the lock is taken', async () => {

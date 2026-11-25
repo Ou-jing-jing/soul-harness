@@ -30,6 +30,7 @@
 import { join } from 'node:path';
 
 import { migrate, openStore, verifySchema, type Store } from '@soul-harness/persistence';
+import type { SchedulerStats } from '@soul-harness/runtime';
 
 import type { DaemonConfig } from './config.js';
 import {
@@ -109,6 +110,7 @@ export interface DaemonStatus {
   readonly lockPath: string | null;
   readonly personaLifecycleAssembled: boolean;
   readonly recovery: DaemonRecoverySummary | null;
+  readonly scheduler: SchedulerStats | null;
   readonly components: DaemonComponentSurface;
   readonly capabilities: RuntimeCapabilitySurface;
 }
@@ -205,6 +207,7 @@ export class SoulDaemon {
       lockPath: this.#lock?.path ?? null,
       personaLifecycleAssembled: this.#lifecycle !== null,
       recovery: this.#recovery,
+      scheduler: this.#scheduler?.stats() ?? null,
       components: this.#surface.components,
       capabilities: this.#surface.capabilities,
     };
