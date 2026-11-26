@@ -1,5 +1,8 @@
+import { execFileSync } from 'node:child_process';
 import {
   closeSync,
+  existsSync,
+  mkdirSync,
   openSync,
   chmodSync,
   readFileSync,
@@ -61,6 +64,7 @@ describe('API token lifecycle', () => {
     const token = readToken(dir);
 
     expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+    expect(statSync(tokenPath(dir)).size).toBe(44);
     expect(verifier.verify(token)).toBe(true);
     expect(verifier.verify(`${token}x`)).toBe(false);
     expect(verifier.verify(undefined)).toBe(false);
@@ -94,6 +98,41 @@ describe('API token lifecycle', () => {
     const dir = tempDir();
     writeFileSync(tokenPath(dir), 'a'.repeat(129), { encoding: 'utf8', mode: 0o600 });
     expect(codeOf(() => loadOrCreateApiToken(dir))).toBe('api_token_invalid');
+  });
+
+  it('rejects a directory at the token path', () => {
+    const dir = tempDir();
+    mkdirSync(tokenPath(dir));
+    expect(codeOf(() => loadOrCreateApiToken(dir))).toBe('api_token_invalid');
+  });
+
+  it.skipIf(!isPosix)(
+    'rejects a FIFO without blocking on POSIX',
+    () => {
+      const dir = tempDir();
+      execFileSync('mkfifo', [tokenPath(dir)], { stdio: 'ignore' });
+      expect(codeOf(() => loadOrCreateApiToken(dir))).toBe('api_token_invalid');
+    },
+    10_000,
+  );
+
+  it.skipIf(!isPosix)('rejects a device fd at the descriptor boundary', () => {
+    if (!existsSync('/dev/null')) {
+      return;
+    }
+    const fd = openSync('/dev/null', 'r');
+    try {
+      expect(
+        codeOf(() =>
+          readTokenFromDescriptor(fd, {
+            platform: process.platform,
+            getuid: () => (typeof process.getuid === 'function' ? process.getuid() : undefined),
+          }),
+        ),
+      ).toBe('api_token_invalid');
+    } finally {
+      closeSync(fd);
+    }
   });
 
   it.skipIf(!isPosix)('rejects a symlink instead of reading its target', () => {

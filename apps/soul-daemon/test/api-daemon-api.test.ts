@@ -1,4 +1,4 @@
-﻿import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
 import type { EventRow, SessionRow, TaskRow } from '@soul-harness/persistence';
 import type { PersonaSnapshot } from '@soul-harness/runtime';
@@ -12,6 +12,22 @@ import {
   type SessionFacade,
   type TaskFacade,
 } from '../src/api/daemon-api.js';
+
+const status = {
+  phase: 'RUNNING',
+  pid: 1234,
+  dataDir: 'C:\\private\\soul-data',
+  startedAt: '2026-01-01T00:00:00.000Z',
+  bootId: 'boot-id',
+  storeOpen: true,
+  lockHeld: true,
+  lockPath: 'C:\\private\\soul.lock',
+  personaLifecycleAssembled: true,
+  recovery: null,
+  scheduler: null,
+  components: {},
+  capabilities: {},
+} as unknown as DaemonStatus;
 
 const persona = {
   id: 'persona-1',
@@ -88,7 +104,7 @@ function makeDeps(): DaemonApiFacadeDependencies {
   } as unknown as SessionFacade;
 
   return {
-    status: () => ({ phase: 'RUNNING' }) as unknown as DaemonStatus,
+    status: () => status,
     readiness: () => ({ ready: true, reason: null }),
     personas,
     events,
@@ -206,9 +222,28 @@ describe('DaemonApi facade boundary', () => {
     expect(facade.listSessions({ personaId: 'persona-1', limit: 1 })).toHaveLength(1);
   });
 
-  it('delegates status and readiness without exposing internal state', () => {
+  it('projects status through a path-independent allowlist', () => {
     const facade = createDaemonApiFacade(makeDeps());
-    expect(facade.getStatus()).toStrictEqual({ phase: 'RUNNING' });
+    const view = facade.getStatus();
+
+    expect(view).toStrictEqual({
+      phase: 'RUNNING',
+      pid: 1234,
+      startedAt: '2026-01-01T00:00:00.000Z',
+      bootId: 'boot-id',
+      storeOpen: true,
+      lockHeld: true,
+      personaLifecycleAssembled: true,
+      recovery: null,
+      scheduler: null,
+      components: {},
+      capabilities: {},
+    });
+    expect(view).not.toHaveProperty('dataDir');
+    expect(view).not.toHaveProperty('lockPath');
+    expect(JSON.stringify(view)).not.toContain('private');
+    expect(JSON.stringify(view)).not.toContain('soul-data');
+    expect(JSON.stringify(view)).not.toContain('soul.lock');
     expect(facade.getReadiness()).toStrictEqual({ ready: true, reason: null });
   });
 });

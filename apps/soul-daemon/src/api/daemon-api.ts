@@ -56,8 +56,28 @@ export interface DaemonApiFacadeDependencies {
   readonly sessions: SessionFacade;
 }
 
+/**
+ * Path-independent allowlist projection of DaemonStatus.
+ *
+ * `DaemonStatus` contains dataDir/lockPath for operational logging. Those
+ * fields must never cross the management API boundary.
+ */
+export interface StatusView {
+  readonly phase: DaemonStatus['phase'];
+  readonly pid: DaemonStatus['pid'];
+  readonly startedAt: DaemonStatus['startedAt'];
+  readonly bootId: DaemonStatus['bootId'];
+  readonly storeOpen: DaemonStatus['storeOpen'];
+  readonly lockHeld: DaemonStatus['lockHeld'];
+  readonly personaLifecycleAssembled: DaemonStatus['personaLifecycleAssembled'];
+  readonly recovery: DaemonStatus['recovery'];
+  readonly scheduler: DaemonStatus['scheduler'];
+  readonly components: DaemonStatus['components'];
+  readonly capabilities: DaemonStatus['capabilities'];
+}
+
 export interface DaemonApi {
-  getStatus(): DaemonStatus;
+  getStatus(): StatusView;
   getReadiness(): Readiness;
   listPersonas(query: {
     readonly state?: PersonaState;
@@ -161,13 +181,29 @@ function sortByTaskId(a: TaskRow, b: TaskRow): number {
   return a.id.localeCompare(b.id);
 }
 
+function toStatusView(status: DaemonStatus): StatusView {
+  return {
+    phase: status.phase,
+    pid: status.pid,
+    startedAt: status.startedAt,
+    bootId: status.bootId,
+    storeOpen: status.storeOpen,
+    lockHeld: status.lockHeld,
+    personaLifecycleAssembled: status.personaLifecycleAssembled,
+    recovery: status.recovery,
+    scheduler: status.scheduler,
+    components: status.components,
+    capabilities: status.capabilities,
+  };
+}
+
 /**
  * Builds the only object the API server is allowed to see. The dependency
  * object itself is not retained as a public property of the returned facade.
  */
 export function createDaemonApiFacade(deps: DaemonApiFacadeDependencies): DaemonApi {
   return Object.freeze({
-    getStatus: (): DaemonStatus => deps.status(),
+    getStatus: (): StatusView => toStatusView(deps.status()),
     getReadiness: (): Readiness => deps.readiness(),
 
     listPersonas: (query: {

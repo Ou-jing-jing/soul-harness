@@ -137,6 +137,16 @@ function assertNoFollowAvailable(opts: ResolvedTokenOptions): void {
   }
 }
 
+function assertNonBlockingAvailable(opts: ResolvedTokenOptions): void {
+  if (!isPosix(opts.platform)) {
+    return;
+  }
+  const flag = constants.O_NONBLOCK as number | undefined;
+  if (flag === undefined || !Number.isInteger(flag) || flag <= 0) {
+    insecure('O_NONBLOCK is unavailable on this platform');
+  }
+}
+
 function assertRegularFile(stat: Stats, platform: NodeJS.Platform): void {
   if (!stat.isFile()) {
     invalid('API token path is not a regular file');
@@ -216,10 +226,17 @@ function openExisting(path: string, opts: ResolvedTokenOptions): number | null {
     // Windows has no dependable O_NOFOLLOW via Node. This lstat only rejects an
     // obvious reparse point; the same-user ACL boundary remains documented.
     try {
-      if (lstatSync(path).isSymbolicLink()) {
+      const stat = lstatSync(path);
+      if (stat.isSymbolicLink()) {
         insecure('API token path must not be a symbolic link');
       }
+      if (!stat.isFile()) {
+        invalid('API token path is not a regular file');
+      }
     } catch (error) {
+      if (error instanceof DaemonError) {
+        throw error;
+      }
       if (codeOf(error) === 'ENOENT') {
         return null;
       }
@@ -232,7 +249,8 @@ function openExisting(path: string, opts: ResolvedTokenOptions): number | null {
     flags = 'r';
   } else {
     assertNoFollowAvailable(opts);
-    flags = constants.O_RDONLY | (opts.noFollow as number);
+    assertNonBlockingAvailable(opts);
+    flags = constants.O_RDONLY | (opts.noFollow as number) | (constants.O_NONBLOCK as number);
   }
 
   try {
@@ -263,11 +281,16 @@ function readExistingToken(path: string, opts: ResolvedTokenOptions): string | n
 
 function createToken(path: string, opts: ResolvedTokenOptions): string {
   assertNoFollowAvailable(opts);
+  assertNonBlockingAvailable(opts);
   const token = randomBytes(API_TOKEN_BYTES).toString('base64url');
   const flags =
     opts.platform === 'win32'
       ? 'wx'
-      : constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (opts.noFollow as number);
+      : constants.O_WRONLY |
+        constants.O_CREAT |
+        constants.O_EXCL |
+        (opts.noFollow as number) |
+        (constants.O_NONBLOCK as number);
 
   let fd: number;
   try {
@@ -294,9 +317,20 @@ function createToken(path: string, opts: ResolvedTokenOptions): string {
     assertRegularFile(stat, opts.platform);
     assertOwner(stat, opts);
     try {
-      writeSync(fd, Buffer.from(`${token}\n`, 'utf8'));
+      const payload = Buffer.from(`${token}\n`, 'utf8');
+      let offset = 0;
+      while (offset < payload.length) {
+        const written = writeSync(fd, payload, offset, payload.length - offset);
+        if (written <= 0) {
+          ioFailed('API token file write made no progress', new Error('short write'));
+        }
+        offset += written;
+      }
       fsyncSync(fd);
     } catch (error) {
+      if (error instanceof DaemonError) {
+        throw error;
+      }
       ioFailed('API token file cannot be written', error);
     }
   } finally {
