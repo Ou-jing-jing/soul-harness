@@ -183,6 +183,9 @@ export class SoulDaemon {
   #lifecycle: PersonaRecoveryOutcome['lifecycle'] | null = null;
   #apiToken: ApiTokenVerifier | null = null;
   #api: LocalApiServer | null = null;
+  /** Sticky: an API close failure keeps Store/Lock protected across stop(). */
+  #apiCloseFailed = false;
+  #apiCloseCause: unknown = undefined;
   #ingress: ReturnType<typeof createDaemonIngress> | null = null;
   #scheduler: ReturnType<typeof createDaemonScheduler> | null = null;
   #surface: DaemonRuntimeSurface = CURRENT_RUNTIME_SURFACE;
@@ -432,6 +435,13 @@ export class SoulDaemon {
       return this.#lastStopReport;
     }
 
+    // A failed API close is unresolved resource safety state, not a transient
+    // cleanup error. Do not let a later stop() (notably main.run() after a boot
+    // failure) enter the ordinary closing path and release Store/Lock.
+    if (this.#apiCloseFailed) {
+      throw this.#rejectApiCloseFailure();
+    }
+
     const ranForReal = this.#phase === 'RUNNING' || this.#phase === 'READY';
     const steps: StepOutcome[] = [];
 
@@ -510,18 +520,25 @@ export class SoulDaemon {
   }
 
   async #closeApi(outcomes: StepOutcome[]): Promise<boolean> {
+    if (this.#apiCloseFailed) {
+      return true;
+    }
     const api = this.#api;
-    this.#api = null;
     if (api === null) {
       return false;
     }
     const wasFailed = api.state === 'failed';
     try {
       await api.close();
+      this.#api = null;
       this.#surface = wasFailed ? API_FAILED_SURFACE : API_STOPPED_SURFACE;
       outcomes.push({ step: 'http_api', status: 'ok' });
       return false;
     } catch (error) {
+      // Keep both the object and the failure bit. A later release pass must
+      // not mistake `#api === null` for a successful close.
+      this.#apiCloseFailed = true;
+      this.#apiCloseCause = error;
       this.#surface = API_FAILED_SURFACE;
       const code = isDaemonError(error) ? error.code : 'shutdown_failed';
       outcomes.push({ step: 'http_api', status: 'failed', code });
@@ -582,6 +599,9 @@ export class SoulDaemon {
    * next process cannot open a file this process failed to close cleanly.
    */
   #releaseStoreAndLock(outcomes: StepOutcome[]): void {
+    if (this.#apiCloseFailed) {
+      return;
+    }
     let storeCloseFailed = this.#storeCloseFailed;
     const retained: Resource[] = [];
 
@@ -629,6 +649,15 @@ export class SoulDaemon {
     const failures = steps.filter((entry) => entry.status === 'failed');
     const error = new DaemonError('shutdown_failed', 'daemon stopped with cleanup failures', {
       details: { failures: failures.length, first: failures[0]?.step ?? 'unknown' },
+    });
+    this.#shutdownDone.reject(error);
+    return error;
+  }
+
+  #rejectApiCloseFailure(): DaemonError {
+    const error = new DaemonError('shutdown_failed', 'daemon stopped with cleanup failures', {
+      ...(this.#apiCloseCause === undefined ? {} : { cause: this.#apiCloseCause }),
+      details: { failures: 1, first: 'http_api' },
     });
     this.#shutdownDone.reject(error);
     return error;

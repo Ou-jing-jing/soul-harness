@@ -6,7 +6,7 @@ import { loadConfig, type DaemonConfig } from '../src/config.js';
 import { SoulDaemon } from '../src/daemon.js';
 import { DaemonError } from '../src/errors.js';
 import { LOCK_FILE_NAME } from '../src/lock.js';
-import { exitCodeFor } from '../src/main.js';
+import { exitCodeFor, run } from '../src/main.js';
 import type { LocalApiServer, LocalApiServerOptions } from '../src/api/server.js';
 import {
   createRecordingLogger,
@@ -52,7 +52,8 @@ const control = vi.hoisted(() => {
       | 'stop-hang'
       | 'stop-reject'
       | 'store-close-fail',
-    apiMode: 'passthrough' as 'passthrough' | 'listen-fail' | 'close-fail' | 'drain-fail',
+    apiMode: 'passthrough' as
+      'passthrough' | 'listen-fail' | 'listen-close-fail' | 'close-fail' | 'drain-fail',
     ingress: [] as SeenIngress[],
     schedulers: [] as SeenScheduler[],
     ingressCloses: 0,
@@ -209,7 +210,7 @@ vi.mock('../src/api/server.js', async (importOriginal) => {
         },
         app: {} as never,
         async listen(): Promise<void> {
-          if (control.apiMode === 'listen-fail') {
+          if (control.apiMode === 'listen-fail' || control.apiMode === 'listen-close-fail') {
             state = 'failed';
             throw new DaemonError('http_api_start_failed', 'fake listen failure');
           }
@@ -223,7 +224,7 @@ vi.mock('../src/api/server.js', async (importOriginal) => {
           state = 'draining';
         },
         async close(): Promise<void> {
-          if (control.apiMode === 'close-fail') {
+          if (control.apiMode === 'close-fail' || control.apiMode === 'listen-close-fail') {
             state = 'failed';
             throw new DaemonError('shutdown_failed', 'fake close failure');
           }
@@ -461,6 +462,50 @@ describe('READY failure paths', () => {
 
     control.apiMode = 'passthrough';
     control.mode = 'passthrough';
+  });
+
+  it('persists API close failure from boot cleanup across a later stop', async () => {
+    control.apiMode = 'listen-close-fail';
+    const dir = tempDir();
+    const { daemon } = makeDaemon(dir);
+
+    const startError = await daemon.start().catch((error: unknown) => error);
+    expect(startError).toMatchObject({ code: 'http_api_start_failed' });
+    expect(daemon.phase).toBe('FAILED');
+    expect(daemon.status.storeOpen).toBe(true);
+    expect(daemon.status.lockHeld).toBe(true);
+    expect(existsSync(join(dir, LOCK_FILE_NAME))).toBe(true);
+
+    const stopError = await daemon.stop('startup_failed').catch((error: unknown) => error);
+    expect(stopError).toMatchObject({
+      code: 'shutdown_failed',
+      details: { failures: 1, first: 'http_api' },
+    });
+    expect(exitCodeFor(stopError)).toBe(6);
+    expect(daemon.status.storeOpen).toBe(true);
+    expect(daemon.status.lockHeld).toBe(true);
+    expect(existsSync(join(dir, LOCK_FILE_NAME))).toBe(true);
+    await expect(daemon.whenStopped()).rejects.toMatchObject({
+      code: 'shutdown_failed',
+      details: { failures: 1, first: 'http_api' },
+    });
+
+    control.apiMode = 'passthrough';
+    forceCleanup(dir);
+  });
+
+  it('main.run returns exit code 6 when boot cleanup cannot close the API', async () => {
+    control.apiMode = 'listen-close-fail';
+    const dir = tempDir();
+    const code = await run({
+      ...TEST_POLICY_ENV,
+      SOUL_DATA_DIR: dir,
+    });
+    expect(code).toBe(6);
+    expect(existsSync(join(dir, LOCK_FILE_NAME))).toBe(true);
+
+    control.apiMode = 'passthrough';
+    forceCleanup(dir);
   });
 
   it('keeps store and lock when API close rejects', async () => {

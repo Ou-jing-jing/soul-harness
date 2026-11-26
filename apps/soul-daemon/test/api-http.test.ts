@@ -437,6 +437,22 @@ describe('HTTP limits and errors', () => {
     await closing;
   });
 
+  it('does not report a rejected API close as successful or already closed', async () => {
+    const server = makeServer();
+    const closeable = server.app as unknown as { close: () => Promise<void> };
+    const original = closeable.close;
+    closeable.close = async () => {
+      throw new Error('close failed');
+    };
+
+    await expect(server.close()).rejects.toMatchObject({ code: 'shutdown_failed' });
+    expect(server.state).toBe('failed');
+
+    closeable.close = original;
+    await server.close();
+    expect(server.state).toBe('stopped');
+  });
+
   it('returns 503 while draining', async () => {
     const server = makeServer();
     await server.beginDrain();

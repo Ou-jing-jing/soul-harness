@@ -163,9 +163,9 @@ export function createLocalApiServer(options: LocalApiServerOptions): LocalApiSe
       if (closed) {
         return;
       }
-      closed = true;
       try {
         await runtime.app.close();
+        closed = true;
         state = 'stopped';
       } catch (error) {
         state = 'failed';
