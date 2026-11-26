@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync } from 'node:fs';
+import { existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { loadConfig, type DaemonConfig } from '../src/config.js';
@@ -7,6 +7,7 @@ import { SoulDaemon } from '../src/daemon.js';
 import { DaemonError } from '../src/errors.js';
 import { LOCK_FILE_NAME } from '../src/lock.js';
 import { exitCodeFor } from '../src/main.js';
+import type { LocalApiServer, LocalApiServerOptions } from '../src/api/server.js';
 import {
   createRecordingLogger,
   makeTempDir,
@@ -51,6 +52,7 @@ const control = vi.hoisted(() => {
       | 'stop-hang'
       | 'stop-reject'
       | 'store-close-fail',
+    apiMode: 'passthrough' as 'passthrough' | 'listen-fail' | 'close-fail' | 'drain-fail',
     ingress: [] as SeenIngress[],
     schedulers: [] as SeenScheduler[],
     ingressCloses: 0,
@@ -187,10 +189,56 @@ vi.mock('@soul-harness/runtime', async (importOriginal) => {
   };
 });
 
+vi.mock('../src/api/server.js', async (importOriginal) => {
+  const actual = (await importOriginal()) as {
+    createLocalApiServer(options: LocalApiServerOptions): LocalApiServer;
+  };
+  return {
+    ...actual,
+    createLocalApiServer(options: LocalApiServerOptions): LocalApiServer {
+      if (control.apiMode === 'passthrough') {
+        return actual.createLocalApiServer(options);
+      }
+      let state: 'assembled' | 'running' | 'draining' | 'stopped' | 'failed' = 'assembled';
+      return {
+        get state() {
+          return state;
+        },
+        get listening() {
+          return state === 'running' || state === 'draining';
+        },
+        app: {} as never,
+        async listen(): Promise<void> {
+          if (control.apiMode === 'listen-fail') {
+            state = 'failed';
+            throw new DaemonError('http_api_start_failed', 'fake listen failure');
+          }
+          state = 'running';
+        },
+        async beginDrain(): Promise<void> {
+          if (control.apiMode === 'drain-fail') {
+            state = 'failed';
+            throw new DaemonError('shutdown_failed', 'fake drain failure');
+          }
+          state = 'draining';
+        },
+        async close(): Promise<void> {
+          if (control.apiMode === 'close-fail') {
+            state = 'failed';
+            throw new DaemonError('shutdown_failed', 'fake close failure');
+          }
+          state = 'stopped';
+        },
+      };
+    },
+  };
+});
+
 const dirs: string[] = [];
 
 beforeEach(() => {
   control.mode = 'passthrough';
+  control.apiMode = 'passthrough';
   control.ingress.length = 0;
   control.schedulers.length = 0;
   control.ingressCloses = 0;
@@ -214,6 +262,13 @@ function makeDaemon(dir: string): { daemon: SoulDaemon; config: DaemonConfig } {
   const config = loadConfig({ SOUL_DATA_DIR: dir, ...TEST_POLICY_ENV }, process.cwd());
   const { logger } = createRecordingLogger();
   return { daemon: new SoulDaemon({ config, logger }), config };
+}
+
+/** Test-only cleanup after a deliberately retained Store/Lock failure. */
+function forceCleanup(dir: string): void {
+  const store = control.schedulers[0]?.store as { close(): void } | undefined;
+  store?.close();
+  rmSync(join(dir, LOCK_FILE_NAME), { force: true });
 }
 
 describe('READY failure paths', () => {
@@ -364,6 +419,87 @@ describe('READY failure paths', () => {
     expect(daemon.status.lockHeld).toBe(false);
     expect(existsSync(join(dir, LOCK_FILE_NAME))).toBe(false);
     expect(exitCodeFor(caught)).toBe(6);
+  });
+
+  it('keeps store and lock when API listen fails and scheduler.stop rejects', async () => {
+    control.apiMode = 'listen-fail';
+    control.mode = 'stop-reject';
+    const dir = tempDir();
+    const { daemon } = makeDaemon(dir);
+
+    const caught = await daemon.start().catch((error: unknown) => error);
+    expect(caught).toMatchObject({ code: 'http_api_start_failed' });
+    expect(daemon.status.storeOpen).toBe(true);
+    expect(daemon.status.lockHeld).toBe(true);
+    expect(existsSync(join(dir, LOCK_FILE_NAME))).toBe(true);
+
+    control.apiMode = 'passthrough';
+    control.mode = 'passthrough';
+    forceCleanup(dir);
+  });
+
+  it('does not force release while API listen failed and scheduler.stop is pending', async () => {
+    control.apiMode = 'listen-fail';
+    control.mode = 'stop-hang';
+    const dir = tempDir();
+    const { daemon } = makeDaemon(dir);
+
+    const startPromise = daemon.start();
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    expect(daemon.status.storeOpen).toBe(true);
+    expect(daemon.status.lockHeld).toBe(true);
+
+    const release = control.releaseStop;
+    if (release === null) {
+      throw new Error('stop gate was not installed');
+    }
+    release();
+    const caught = await startPromise.catch((error: unknown) => error);
+    expect(caught).toMatchObject({ code: 'http_api_start_failed' });
+    expect(daemon.status.storeOpen).toBe(false);
+    expect(daemon.status.lockHeld).toBe(false);
+
+    control.apiMode = 'passthrough';
+    control.mode = 'passthrough';
+  });
+
+  it('keeps store and lock when API close rejects', async () => {
+    control.apiMode = 'close-fail';
+    const dir = tempDir();
+    const { daemon } = makeDaemon(dir);
+    await daemon.start();
+
+    const caught = await daemon.stop('api-close-failed').catch((error: unknown) => error);
+    expect(caught).toMatchObject({
+      code: 'shutdown_failed',
+      details: { first: 'http_api' },
+    });
+    expect(daemon.phase).toBe('DRAINING');
+    expect(daemon.status.components.httpApi).toBe('failed');
+    expect(daemon.status.capabilities.httpApi).toBe('unavailable');
+    expect(daemon.status.storeOpen).toBe(true);
+    expect(daemon.status.lockHeld).toBe(true);
+    expect(existsSync(join(dir, LOCK_FILE_NAME))).toBe(true);
+    forceCleanup(dir);
+  });
+
+  it('keeps store and lock when api.beginDrain rejects', async () => {
+    control.apiMode = 'drain-fail';
+    const dir = tempDir();
+    const { daemon } = makeDaemon(dir);
+    await daemon.start();
+
+    const caught = await daemon.stop('api-drain-failed').catch((error: unknown) => error);
+    expect(caught).toMatchObject({
+      code: 'shutdown_failed',
+      details: { first: 'http_api' },
+    });
+    expect(daemon.phase).toBe('DRAINING');
+    expect(daemon.status.components.httpApi).toBe('failed');
+    expect(daemon.status.capabilities.httpApi).toBe('unavailable');
+    expect(daemon.status.storeOpen).toBe(true);
+    expect(daemon.status.lockHeld).toBe(true);
+    forceCleanup(dir);
   });
 
   it('does not close the store when scheduler.stop rejects', async () => {

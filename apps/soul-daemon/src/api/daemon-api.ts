@@ -21,14 +21,15 @@ import {
 import type { PersonaLifecycle, PersonaSnapshot } from '@soul-harness/runtime';
 
 import type { DaemonStatus } from '../daemon.js';
-import type {
-  EventId,
-  EventView,
-  PersonaId,
-  PersonaView,
-  Readiness,
-  SessionView,
-  TaskView,
+import {
+  EVENT_STATUS_VALUES,
+  type EventId,
+  type EventView,
+  type PersonaId,
+  type PersonaView,
+  type Readiness,
+  type SessionView,
+  type TaskView,
 } from './wire.js';
 
 export type PersonaFacade = Pick<
@@ -108,17 +109,6 @@ export interface DaemonApi {
 
 type RuntimePersonaId = Parameters<PersonaLifecycle['getPersona']>[0];
 type RepositoryPersonaId = Parameters<EventRepository['getById']>[0]['personaId'];
-
-const EVENT_STATUS_VALUES: readonly EventRow['status'][] = [
-  'received',
-  'accepted',
-  'noticed',
-  'understood',
-  'response_committed',
-  'acted',
-  'rejected',
-  'expired',
-];
 
 function toPersonaView(persona: PersonaSnapshot): PersonaView {
   return {

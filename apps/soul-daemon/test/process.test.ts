@@ -295,20 +295,24 @@ describe('real process lifecycle', { timeout: TEST_TIMEOUT }, () => {
   );
 
   it(
-    'runs two instances on different data directories',
+    'does not start a second daemon when the fixed API port is already held',
     async () => {
-      const a = spawnDaemon({ env: { SOUL_DATA_DIR: tempDir() } });
-      const b = spawnDaemon({ env: { SOUL_DATA_DIR: tempDir() } });
-      daemons.push(a, b);
+      const firstDir = tempDir();
+      const secondDir = tempDir();
+      const first = spawnDaemon({ env: { SOUL_DATA_DIR: firstDir } });
+      await first.waitFor((record) => isPhase(record, 'RUNNING'));
 
-      await Promise.all([
-        a.waitFor((record) => isPhase(record, 'RUNNING')),
-        b.waitFor((record) => isPhase(record, 'RUNNING')),
-      ]);
+      const second = spawnDaemon({ env: { SOUL_DATA_DIR: secondDir } });
+      daemons.push(first, second);
 
-      expect(a.child.pid).not.toBe(b.child.pid);
-      expect(a.child.exitCode).toBeNull();
-      expect(b.child.exitCode).toBeNull();
+      const code = await second.waitForExit();
+      expect(code).toBe(5);
+      expect(second.records.some((record) => record['code'] === 'http_api_start_failed')).toBe(
+        true,
+      );
+      expect(second.records.some((record) => isPhase(record, 'RUNNING'))).toBe(false);
+      expect(existsSync(join(secondDir, LOCK_FILE_NAME))).toBe(false);
+      expect(first.child.exitCode).toBeNull();
     },
     TEST_TIMEOUT,
   );

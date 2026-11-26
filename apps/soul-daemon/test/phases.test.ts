@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  API_ASSEMBLED_SURFACE,
+  API_DRAINING_SURFACE,
+  API_FAILED_SURFACE,
+  API_RUNNING_SURFACE,
+  API_STOPPED_SURFACE,
   CAPABILITIES,
   CURRENT_RUNTIME_SURFACE,
   READY_TARGET_SURFACE,
@@ -9,7 +14,7 @@ import {
 } from '../src/phases.js';
 
 describe('startup steps stay honest', () => {
-  it('marks recovery, ingress, and the scheduler implemented, and leaves http alone', () => {
+  it('marks recovery, ingress, scheduler, HTTP and health implemented', () => {
     expect(STARTUP_STEPS.map((step) => step.id)).toStrictEqual([
       'config',
       'logging',
@@ -25,11 +30,15 @@ describe('startup steps stay honest', () => {
       'http_api',
       'health_check',
     ]);
-    for (const id of ['persona_recovery', 'runtime_recovery', 'event_bus', 'scheduler']) {
+    for (const id of [
+      'persona_recovery',
+      'runtime_recovery',
+      'event_bus',
+      'scheduler',
+      'http_api',
+      'health_check',
+    ]) {
       expect(STARTUP_STEPS.find((step) => step.id === id)?.status).toBe('implemented');
-    }
-    for (const id of ['http_api', 'health_check']) {
-      expect(STARTUP_STEPS.find((step) => step.id === id)?.status).toBe('not_implemented');
     }
     expect(STARTUP_STEPS.find((step) => step.id === 'http_api')?.owner).toBe('SH-009');
     expect(STARTUP_STEPS.find((step) => step.id === 'health_check')?.owner).toBe('SH-009');
@@ -107,5 +116,22 @@ describe('runtime surface', () => {
     expect(recovered.capabilities.httpApi).toBe('not_implemented');
     expect(recovered).not.toBe(CURRENT_RUNTIME_SURFACE);
     expect(recovered).not.toBe(READY_TARGET_SURFACE);
+  });
+
+  it('uses the frozen API/health component and capability states', () => {
+    const cases = [
+      [API_ASSEMBLED_SURFACE, 'assembled', 'unavailable'],
+      [API_RUNNING_SURFACE, 'running', 'available'],
+      [API_DRAINING_SURFACE, 'draining', 'draining'],
+      [API_STOPPED_SURFACE, 'stopped', 'unavailable'],
+      [API_FAILED_SURFACE, 'failed', 'unavailable'],
+    ] as const;
+    for (const [surface, component, capability] of cases) {
+      expect(surface.components.httpApi).toBe(component);
+      expect(surface.components.healthEndpoint).toBe(component);
+      expect(surface.capabilities.httpApi).toBe(capability);
+      expect(surface.capabilities.healthEndpoint).toBe(capability);
+      expect(surface.components.scheduler.dispatchesTasks).toBe(false);
+    }
   });
 });

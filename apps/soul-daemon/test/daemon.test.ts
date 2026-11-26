@@ -77,7 +77,7 @@ describe('startup', () => {
     expect(report.skippedSteps).not.toContain('runtime_recovery');
     expect(report.skippedSteps).not.toContain('event_bus');
     expect(report.skippedSteps).not.toContain('scheduler');
-    expect(report.skippedSteps).toEqual(['http_api', 'health_check']);
+    expect(report.skippedSteps).toStrictEqual([]);
     expect(report.recovery).toEqual({
       personasNormalized: 0,
       personasScanned: 0,
@@ -104,8 +104,10 @@ describe('startup', () => {
     expect(report.capabilities.eventBus).toBe('assembled_no_transport');
     expect(report.capabilities.eventIngress).toBe('unavailable_no_transport');
     expect(report.capabilities.runtimeRecovery).toBe('assembled');
-    expect(report.capabilities.httpApi).toBe('not_implemented');
-    expect(report.capabilities.healthEndpoint).toBe('not_implemented');
+    expect(report.components.httpApi).toBe('running');
+    expect(report.components.healthEndpoint).toBe('running');
+    expect(report.capabilities.httpApi).toBe('available');
+    expect(report.capabilities.healthEndpoint).toBe('available');
     expect(daemon.status.components).toBe(report.components);
     expect(daemon.status.capabilities).toBe(report.capabilities);
     expect(daemon.status.personaLifecycleAssembled).toBe(true);
@@ -122,7 +124,7 @@ describe('startup', () => {
     expect(running?.['scheduler']).toBe('running');
     expect(running?.['taskDispatch']).toBe('unavailable_no_handlers');
     expect(running?.['eventIngress']).toBe('unavailable_no_transport');
-    expect(running?.['httpApi']).toBe('not_implemented');
+    expect(running?.['httpApi']).toBe('available');
     expect(records.some((record) => record['event'] === 'scheduler_started')).toBe(true);
     expect(
       records.some((record) => record['event'] === 'scheduler_started' && record['handlers'] === 0),
@@ -257,6 +259,7 @@ describe('shutdown', () => {
     expect(report.steps.map((step) => step.step)).toStrictEqual([
       'event_bus',
       'scheduler',
+      'http_api',
       'sqlite_open',
       'instance_lock',
     ]);

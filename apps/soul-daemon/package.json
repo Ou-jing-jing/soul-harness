@@ -32,7 +32,8 @@
   },
   "dependencies": {
     "@soul-harness/persistence": "workspace:*",
-    "@soul-harness/runtime": "workspace:*"
+    "@soul-harness/runtime": "workspace:*",
+    "fastify": "5.12.8"
   },
   "devDependencies": {
     "@types/node": "^24.19.2"

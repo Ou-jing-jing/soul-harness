@@ -11,7 +11,14 @@ import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
   test: {
-    projects: ['packages/*', 'apps/*'],
+    // Point at package configs, not only their directories: the daemon config
+    // sets fileParallelism=false so fixed-port API lifecycle tests cannot race
+    // each other or spawned process tests.
+    projects: ['packages/*/vitest.config.ts', 'apps/*/vitest.config.ts'],
+    // The daemon owns one fixed production port (127.0.0.1:18700). Running
+    // daemon test files concurrently lets two real servers race that port even
+    // though package-level config requests file serialization.
+    fileParallelism: false,
     passWithNoTests: false,
   },
 });

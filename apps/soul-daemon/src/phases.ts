@@ -106,16 +106,16 @@ export const STARTUP_STEPS: readonly LifecycleStep[] = [
   {
     id: 'http_api',
     phase: 'READY',
-    status: 'not_implemented',
+    status: 'implemented',
     owner: 'SH-009',
-    note: 'loopback API/WebSocket not implemented',
+    note: 'loopback HTTP management API; WebSocket remains future',
   },
   {
     id: 'health_check',
     phase: 'READY',
-    status: 'not_implemented',
+    status: 'implemented',
     owner: 'SH-009',
-    note: 'no health transport; status is available in-process only',
+    note: 'anonymous liveness/readiness on the loopback HTTP server',
   },
 ];
 
@@ -174,12 +174,21 @@ export interface SchedulerSurface {
   readonly dispatchesTasks: false;
 }
 
+export type HttpApiComponentState =
+  'not_implemented' | 'assembled' | 'running' | 'draining' | 'stopped' | 'failed';
+
+export type HealthEndpointComponentState = HttpApiComponentState;
+
+export type HttpApiCapability = 'not_implemented' | 'unavailable' | 'draining' | 'available';
+
+export type HealthEndpointCapability = HttpApiCapability;
+
 export interface DaemonComponentSurface {
   readonly personaLifecycle: PersonaLifecycleSurface;
   readonly eventBus: EventBusSurface;
   readonly scheduler: SchedulerSurface;
-  readonly httpApi: 'not_implemented';
-  readonly healthEndpoint: 'not_implemented';
+  readonly httpApi: HttpApiComponentState;
+  readonly healthEndpoint: HealthEndpointComponentState;
 }
 
 /**
@@ -197,8 +206,8 @@ export interface RuntimeCapabilitySurface {
   readonly eventIngress: 'not_implemented' | 'unavailable_no_transport';
   readonly scheduler: 'not_implemented' | 'running';
   readonly taskDispatch: 'not_implemented' | 'unavailable_no_handlers';
-  readonly httpApi: 'not_implemented';
-  readonly healthEndpoint: 'not_implemented';
+  readonly httpApi: HttpApiCapability;
+  readonly healthEndpoint: HealthEndpointCapability;
 }
 
 export interface DaemonRuntimeSurface {
@@ -328,3 +337,27 @@ export const READY_TARGET_SURFACE: DaemonRuntimeSurface = freezeSurface(
     healthEndpoint: 'not_implemented',
   },
 );
+
+function withApiSurface(
+  component: HttpApiComponentState,
+  capability: HttpApiCapability,
+): DaemonRuntimeSurface {
+  return freezeSurface(
+    {
+      ...READY_TARGET_SURFACE.components,
+      httpApi: component,
+      healthEndpoint: component,
+    },
+    {
+      ...READY_TARGET_SURFACE.capabilities,
+      httpApi: capability,
+      healthEndpoint: capability,
+    },
+  );
+}
+
+export const API_ASSEMBLED_SURFACE = withApiSurface('assembled', 'unavailable');
+export const API_RUNNING_SURFACE = withApiSurface('running', 'available');
+export const API_DRAINING_SURFACE = withApiSurface('draining', 'draining');
+export const API_STOPPED_SURFACE = withApiSurface('stopped', 'unavailable');
+export const API_FAILED_SURFACE = withApiSurface('failed', 'unavailable');

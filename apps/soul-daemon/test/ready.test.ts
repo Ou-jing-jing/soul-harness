@@ -115,6 +115,7 @@ describe('READY assembly', () => {
       expect(report.steps.map((step) => step.step)).toStrictEqual([
         'event_bus',
         'scheduler',
+        'http_api',
         'sqlite_open',
         'instance_lock',
       ]);

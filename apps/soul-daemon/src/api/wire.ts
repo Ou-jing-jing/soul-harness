@@ -24,6 +24,17 @@ export const API_BODY_LIMIT_BYTES = 64 * 1024;
 export const API_DEFAULT_LIST_LIMIT = 50;
 export const API_MAX_LIST_LIMIT = 200;
 
+export const EVENT_STATUS_VALUES: readonly EventRow['status'][] = [
+  'received',
+  'accepted',
+  'noticed',
+  'understood',
+  'response_committed',
+  'acted',
+  'rejected',
+  'expired',
+];
+
 export type PersonaId = string;
 export type EventId = string;
 export type TaskId = string;

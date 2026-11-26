@@ -33,6 +33,7 @@ export const DAEMON_ERROR_CODES = [
   'api_token_invalid',
   'api_token_insecure',
   'api_token_io_failed',
+  'http_api_start_failed',
   'shutdown_failed',
   'invalid_transition',
 ] as const;

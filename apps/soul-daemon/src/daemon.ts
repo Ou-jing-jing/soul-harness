@@ -29,7 +29,14 @@
 
 import { join } from 'node:path';
 
-import { migrate, openStore, verifySchema, type Store } from '@soul-harness/persistence';
+import {
+  createRepositories,
+  isStoreUnusable,
+  migrate,
+  openStore,
+  verifySchema,
+  type Store,
+} from '@soul-harness/persistence';
 import type { SchedulerStats } from '@soul-harness/runtime';
 
 import type { DaemonConfig } from './config.js';
@@ -48,7 +55,15 @@ import { DaemonError, isDaemonError } from './errors.js';
 import { acquireInstanceLock, type InstanceLock } from './lock.js';
 import type { Logger } from './logger.js';
 import { loadOrCreateApiToken, type ApiTokenVerifier } from './api/token.js';
+import { createDaemonApiFacade } from './api/daemon-api.js';
+import { createLocalApiServer, type LocalApiServer } from './api/server.js';
+import type { Readiness } from './api/wire.js';
 import {
+  API_ASSEMBLED_SURFACE,
+  API_DRAINING_SURFACE,
+  API_FAILED_SURFACE,
+  API_RUNNING_SURFACE,
+  API_STOPPED_SURFACE,
   CURRENT_RUNTIME_SURFACE,
   READY_TARGET_SURFACE,
   RECOVERED_RUNTIME_SURFACE,
@@ -167,6 +182,7 @@ export class SoulDaemon {
   #store: Store | null = null;
   #lifecycle: PersonaRecoveryOutcome['lifecycle'] | null = null;
   #apiToken: ApiTokenVerifier | null = null;
+  #api: LocalApiServer | null = null;
   #ingress: ReturnType<typeof createDaemonIngress> | null = null;
   #scheduler: ReturnType<typeof createDaemonScheduler> | null = null;
   #surface: DaemonRuntimeSurface = CURRENT_RUNTIME_SURFACE;
@@ -218,6 +234,29 @@ export class SoulDaemon {
   /** E1 seam for a future API server; no token is exposed. */
   verifyApiToken(candidate: string): boolean {
     return this.#apiToken?.verify(candidate) ?? false;
+  }
+
+  #readiness(): Readiness {
+    if (this.#phase === 'DRAINING') {
+      return { ready: false, reason: 'draining' };
+    }
+    if (this.#phase !== 'RUNNING') {
+      return { ready: false, reason: 'phase_not_running' };
+    }
+    const store = this.#store;
+    if (store === null || store.isClosed || isStoreUnusable(store)) {
+      return { ready: false, reason: 'store_unavailable' };
+    }
+    if (this.#lock === null) {
+      return { ready: false, reason: 'lock_not_held' };
+    }
+    if (this.#recovery === null) {
+      return { ready: false, reason: 'recovery_incomplete' };
+    }
+    if (this.#api?.state !== 'running') {
+      return { ready: false, reason: 'api_not_listening' };
+    }
+    return { ready: true, reason: null };
   }
 
   /** Resolves once the daemon has fully stopped; rejects if cleanup failed. */
@@ -394,6 +433,7 @@ export class SoulDaemon {
     }
 
     const ranForReal = this.#phase === 'RUNNING' || this.#phase === 'READY';
+    const steps: StepOutcome[] = [];
 
     if (ranForReal) {
       this.#enter('DRAINING');
@@ -408,6 +448,10 @@ export class SoulDaemon {
           reason: 'not_implemented',
         });
       }
+      const apiDrainFailed = await this.#beginApiDrain(steps);
+      if (apiDrainFailed) {
+        throw this.#rejectShutdown(steps);
+      }
     }
 
     // Checkpointing is only legal when a runtime exists to produce one. Writing a
@@ -415,12 +459,16 @@ export class SoulDaemon {
     // There is no drain and no shutdown deadline.
     this.#logger.info('checkpoint_skipped', { reason: 'runtime_not_implemented' });
 
-    const steps: StepOutcome[] = [];
     this.#closeIngress(steps);
     const schedulerFailed = await this.#stopScheduler(steps);
     if (schedulerFailed || this.#schedulerStopFailed) {
       // The scheduler may still be inside the store. Do not close it and do
       // not drop the lock just because stop rejected.
+      throw this.#rejectShutdown(steps);
+    }
+
+    const apiCloseFailed = await this.#closeApi(steps);
+    if (apiCloseFailed) {
       throw this.#rejectShutdown(steps);
     }
 
@@ -443,11 +491,51 @@ export class SoulDaemon {
     return report;
   }
 
+  async #beginApiDrain(outcomes: StepOutcome[]): Promise<boolean> {
+    const api = this.#api;
+    if (api === null) {
+      return false;
+    }
+    try {
+      await api.beginDrain();
+      this.#surface = API_DRAINING_SURFACE;
+      return false;
+    } catch (error) {
+      this.#surface = API_FAILED_SURFACE;
+      const code = isDaemonError(error) ? error.code : 'shutdown_failed';
+      outcomes.push({ step: 'http_api', status: 'failed', code });
+      this.#logger.error('cleanup_failed', { step: 'http_api', code });
+      return true;
+    }
+  }
+
+  async #closeApi(outcomes: StepOutcome[]): Promise<boolean> {
+    const api = this.#api;
+    this.#api = null;
+    if (api === null) {
+      return false;
+    }
+    const wasFailed = api.state === 'failed';
+    try {
+      await api.close();
+      this.#surface = wasFailed ? API_FAILED_SURFACE : API_STOPPED_SURFACE;
+      outcomes.push({ step: 'http_api', status: 'ok' });
+      return false;
+    } catch (error) {
+      this.#surface = API_FAILED_SURFACE;
+      const code = isDaemonError(error) ? error.code : 'shutdown_failed';
+      outcomes.push({ step: 'http_api', status: 'failed', code });
+      this.#logger.error('cleanup_failed', { step: 'http_api', code });
+      return true;
+    }
+  }
+
   async #releaseAll(): Promise<StepOutcome[]> {
     const outcomes: StepOutcome[] = [];
+    const apiCloseFailed = await this.#closeApi(outcomes);
     this.#closeIngress(outcomes);
     const schedulerFailed = await this.#stopScheduler(outcomes);
-    if (!schedulerFailed && !this.#schedulerStopFailed) {
+    if (!apiCloseFailed && !schedulerFailed && !this.#schedulerStopFailed) {
       this.#releaseStoreAndLock(outcomes);
     }
     return outcomes;
@@ -529,7 +617,11 @@ export class SoulDaemon {
       this.#store = null;
       this.#lifecycle = null;
       this.#apiToken = null;
-      this.#surface = CURRENT_RUNTIME_SURFACE;
+      // A failed API must stay failed even after its Store/Lock cleanup; a
+      // clean stop or a pre-API boot failure resets to the static surface.
+      if (this.#surface.components.httpApi !== 'failed') {
+        this.#surface = CURRENT_RUNTIME_SURFACE;
+      }
     }
   }
 
@@ -592,11 +684,59 @@ export class SoulDaemon {
       handlerKinds: 0,
       dispatchesTasks: false,
     });
+
+    await this.#boundary();
+    this.#surface = API_ASSEMBLED_SURFACE;
+    try {
+      const repositories = createRepositories(store);
+      const lifecycle = this.#lifecycle;
+      const token = this.#apiToken;
+      if (lifecycle === null || token === null) {
+        throw new DaemonError('http_api_start_failed', 'local API prerequisites are missing');
+      }
+      const api = createDaemonApiFacade({
+        status: () => this.status,
+        readiness: () => this.#readiness(),
+        personas: lifecycle,
+        events: repositories.events,
+        tasks: repositories.tasks,
+        sessions: repositories.sessions,
+      });
+      this.#api = createLocalApiServer({
+        api,
+        token,
+        readiness: () => this.#readiness(),
+      });
+    } catch (error) {
+      this.#surface = API_FAILED_SURFACE;
+      this.#throwAssemblyFailure(error, 'http_api_start_failed', 'local API failed to start');
+    }
+
+    await this.#boundary();
+    const apiServer = this.#api;
+    if (apiServer === null) {
+      this.#surface = API_FAILED_SURFACE;
+      throw new DaemonError('http_api_start_failed', 'local API was not assembled');
+    }
+    try {
+      await apiServer.listen();
+    } catch (error) {
+      this.#surface = API_FAILED_SURFACE;
+      throw isDaemonError(error)
+        ? error
+        : new DaemonError('http_api_start_failed', 'local API failed to start', { cause: error });
+    }
+    this.#surface = API_RUNNING_SURFACE;
+    this.#logger.info('step_ok', {
+      step: 'http_api',
+      httpApi: 'running',
+      healthEndpoint: 'running',
+    });
   }
 
   #throwAssemblyFailure(
     error: unknown,
-    code: 'event_bus_start_failed' | 'scheduler_start_failed',
+    code: 'event_bus_start_failed' | 'scheduler_start_failed' | 'http_api_start_failed',
     message: string,
   ): never {
     if (this.#stopRequested) {
