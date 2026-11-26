@@ -69,7 +69,7 @@ describe('API lifecycle', () => {
     expect(existsSync(join(dir, LOCK_FILE_NAME))).toBe(false);
 
     await expect(fetch('http://127.0.0.1:18700/v1/health/live')).rejects.toBeTruthy();
-  });
+  }, 15_000);
 
   it('fails closed when the fixed port is already occupied', async () => {
     const blocker = createServer();

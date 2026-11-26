@@ -22,6 +22,7 @@ import { TokenBucket } from './http/limits.js';
 import { registerEventReadRoutes } from './routes/events-read.js';
 import { registerHealthRoutes } from './routes/health.js';
 import { registerPersonaReadRoutes } from './routes/personas-read.js';
+import { registerPersonaWriteRoutes } from './routes/personas-write.js';
 import { registerSessionReadRoutes } from './routes/sessions-read.js';
 import { registerStatusRoute } from './routes/status.js';
 import { registerTaskReadRoutes } from './routes/tasks-read.js';
@@ -107,6 +108,7 @@ function createApp(options: LocalApiServerOptions, getState: () => LocalApiState
   });
   registerStatusRoute(app, options.api);
   registerPersonaReadRoutes(app, options.api);
+  registerPersonaWriteRoutes(app, options.api);
   registerEventReadRoutes(app, options.api);
   registerTaskReadRoutes(app, options.api);
   registerSessionReadRoutes(app, options.api);
